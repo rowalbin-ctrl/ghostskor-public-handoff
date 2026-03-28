@@ -1,0 +1,34 @@
+# Game-install/runtime binaries
+/*.dll
+/*.exe
+/*.log
+/GhostsKor.log
+
+# Local fonts/raw assets kept outside the public handoff by default
+/Pretendard.ttf
+/PyeongChang-Regular.ttf
+
+# Local logs / audit files
+/build_log.txt
+/MD_AUDIT_*.tsv
+
+# Build outputs
+/src/build/
+/src/build_log.txt
+/src/build_tmp_log.txt
+
+# MSVC intermediates
+*.obj
+*.lib
+*.exp
+*.pdb
+*.idb
+*.ilk
+*.res
+*.ipdb
+*.iobj
+*.raw
+
+# Misc
+Thumbs.db
+.DS_Store

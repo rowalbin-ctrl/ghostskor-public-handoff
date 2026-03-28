@@ -1,0 +1,6 @@
+#include "EmbeddedResources.h"
+
+IDR_FONT_METRICS_0  RCDATA  "font_metrics.bin"
+IDR_FONT_ATLAS_0    RCDATA  "font_atlas.png"
+IDR_FONT_METRICS_1  RCDATA  "font_metrics2.bin"
+IDR_FONT_ATLAS_1    RCDATA  "font_atlas2.png"
