@@ -764,7 +764,8 @@ void KoreanRenderer::QueueText(const std::string &text, float x, float y,
                                int forceAlign, float maxWidthPx,
                                bool skipMenuClipping, bool yIsTopOfText,
                                uint8_t atlasSlot,
-                               const DrawStylePatch *stylePatch) {
+                               const DrawStylePatch *stylePatch,
+                               float resolutionScale) {
   // Hard suppression for Clockwork Kick subtitle when menu is active
   if (TextHook_IsMenuContext() || TextHook_IsMenuActiveRaw()) {
     std::string clean = text;
@@ -794,6 +795,7 @@ void KoreanRenderer::QueueText(const std::string &text, float x, float y,
   cmd.y = y;
   cmd.scale = scale;
   cmd.fontHeight = fontHeight;
+  cmd.resolutionScale = resolutionScale;
   cmd.style = style;
   cmd.finalWidthEng = finalWidthEng;
   cmd.disableShadow = disableShadow;
@@ -1250,7 +1252,8 @@ void KoreanRenderer::CreateTexture() {
 // original 32px size.
 constexpr float GLOBAL_FONT_SCALE = 0.45f;
 
-float KoreanRenderer::CalculateFinalScale(float fontHeight, float cmdScale) {
+float KoreanRenderer::CalculateFinalScale(float fontHeight, float cmdScale,
+                                          float resolutionScale) {
   float safeHeight = fontHeight;
   if (s_QteScaleMode) {
     // QTE overlay: relaxed clamps so the dramatic shrink animation
@@ -1278,7 +1281,12 @@ float KoreanRenderer::CalculateFinalScale(float fontHeight, float cmdScale) {
   const float cap = s_QteScaleMode ? 5.0f : 2.2f;
   if (finalScale > cap)
     finalScale = cap;
-  return finalScale;
+  // Validate logical font values first; then convert to output pixels.
+  // Otherwise 78 * 2 = 156 at 4K hits the >150 fallback above and becomes 100.
+  const float pixelScale =
+      (std::isfinite(resolutionScale) && resolutionScale > 0.0f)
+          ? resolutionScale : 1.0f;
+  return finalScale * pixelScale;
 }
 
 // -----------------------------------------------------------------------------
@@ -1289,8 +1297,9 @@ float KoreanRenderer::CalculateFinalScale(float fontHeight, float cmdScale) {
 // -----------------------------------------------------------------------------
 float KoreanRenderer::MeasureTextWidthEx(const std::string &text,
                                          float fontHeight, float scale,
-                                         uint8_t atlasSlot) {
-  float finalScale = CalculateFinalScale(fontHeight, scale);
+                                         uint8_t atlasSlot,
+                                         float resolutionScale) {
+  float finalScale = CalculateFinalScale(fontHeight, scale, resolutionScale);
 
   float curWidth = 0.0f;
   float maxWidth = 0.0f;
@@ -2754,7 +2763,8 @@ void KoreanRenderer::Render() {
     }
 
     s_QteScaleMode = cmd.qteScaleMode;
-    const float finalScale = CalculateFinalScale(cmd.fontHeight, cmd.scale);
+    const float finalScale = CalculateFinalScale(
+        cmd.fontHeight, cmd.scale, cmd.resolutionScale);
     s_QteScaleMode = false;
     const float effectiveGlobalOffset = menuMetrics.globalYOffsetPx;
     const float effectiveSmallOffset = menuMetrics.smallMenuYOffsetPx;
@@ -2997,7 +3007,8 @@ void KoreanRenderer::Render() {
     if (cmd.disableAutoWrap) {
       lines.push_back(
           {renderText, KoreanRenderer::MeasureTextWidthEx(renderText, cmd.fontHeight,
-                                                          cmd.scale, renderAtlasSlot)});
+                                                          cmd.scale, renderAtlasSlot,
+                                                          cmd.resolutionScale)});
     } else {
       std::string currentLine;
       float currentLineWidth = 0.0f;

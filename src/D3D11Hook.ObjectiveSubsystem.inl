@@ -436,8 +436,8 @@ static void ProbeObjectiveConsumerCandidates(
     return;
   }
 
-  static const uintptr_t kCandidates[] = {0x2006A0, 0x200780, 0x200B30,
-                                          0x234180, 0x234FA0, 0x23E452};
+  static const uintptr_t kCandidates[] = {IW6Offsets::Profile::Rva_2006A0, IW6Offsets::Profile::Rva_200780, IW6Offsets::Profile::Rva_200B30,
+                                          IW6Offsets::Profile::Rva_234180, IW6Offsets::Profile::Rva_234FA0, IW6Offsets::Profile::Rva_23E452};
   static std::unordered_set<uintptr_t> s_loggedCandidate;
   for (uintptr_t off : kCandidates) {
     if (s_loggedCandidate.find(off) != s_loggedCandidate.end()) {
@@ -456,7 +456,7 @@ static void ProbeObjectiveConsumerCandidates(
 
   // Runtime consumer memory probe (gameMsgWindow family).
   // When stable lane hints are visible, publish as consumer samples.
-  constexpr uintptr_t kGmwBaseOff = 0x17CF880;
+  constexpr uintptr_t kGmwBaseOff = IW6Offsets::Profile::Rva_17D97D0;
   constexpr uintptr_t kGmwStride = 0xC6C8;
   constexpr int kGmwWindowCount = 5;
   struct GmwWindowState {
@@ -502,7 +502,7 @@ static void ProbeObjectiveConsumerCandidates(
   }
   uintptr_t gmw0 = gmwWin[selectedWin].addr;
   uintptr_t gmwSelectedOff = kGmwBaseOff + (uintptr_t)selectedWin * kGmwStride;
-  constexpr uintptr_t kLineTableOff = 0x17F24E0;
+  constexpr uintptr_t kLineTableOff = IW6Offsets::Profile::Rva_17FC430;
   uintptr_t lineBase = s_moduleBase + kLineTableOff;
   float laneX = 0.0f;
   float laneY = 0.0f;
@@ -992,8 +992,8 @@ static void ProbeObjectiveConsumerCandidates(
   static DWORD s_lastRstateLog = 0;
   if (kVerboseRuntimeLogs && (now - s_lastRstateLog) > 1600) {
     s_lastRstateLog = now;
-    constexpr uintptr_t kRStateAOff = 0x1640E38;
-    constexpr uintptr_t kRStateBOff = 0x1640F0C;
+    constexpr uintptr_t kRStateAOff = IW6Offsets::Profile::Rva_1640E38;
+    constexpr uintptr_t kRStateBOff = IW6Offsets::Profile::Rva_17BFC8C;
     uintptr_t rsA = s_moduleBase + kRStateAOff;
     uintptr_t rsB = s_moduleBase + kRStateBOff;
     float a[8] = {0}, b[8] = {0};

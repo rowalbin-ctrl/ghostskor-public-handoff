@@ -178,8 +178,9 @@ static ID3D11ShaderResourceView *TryFindSRVViaEnum(const char *matName) {
     uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
     if (base) {
       DB_EnumXAssets_Internal_t enumFn = reinterpret_cast<DB_EnumXAssets_Internal_t>(
-          base + IW6Offsets::DB_EnumXAssets_Internal_SP);
+          reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(base, IW6Offsets::DB_EnumXAssets_Internal_SP)));
 
+      if (!enumFn) { s_tried = false; return nullptr; }
       // Enumerate all IMAGE assets and log names containing "font"
       struct LogCtx { char buf[512]; } lctx;
       struct AllImgCtx {

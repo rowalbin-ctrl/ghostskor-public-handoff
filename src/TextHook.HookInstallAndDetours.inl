@@ -1,12 +1,9 @@
 static bool IsCodeReady(void *addr) {
-  unsigned char *bytes = (unsigned char *)addr;
-
-  // Check for expected prologue
-  for (size_t i = 0; i < sizeof(EXPECTED_PROLOGUE); i++) {
-    if (bytes[i] != EXPECTED_PROLOGUE[i])
-      return false;
-  }
-  return true;
+  if (!addr || !GameBuild::RuntimeReady()) return false;
+  // This build's ten-argument DrawText wrapper; the old implementation was
+  // split into wrappers and a differently typed command-buffer routine.
+  const unsigned char expected[] = {0x48, 0x83, 0xEC, 0x68};
+  return memcmp(addr, expected, sizeof(expected)) == 0;
 }
 static bool IsProbablyExecutableCode(void *addr) {
   if (!addr)
@@ -44,7 +41,8 @@ static bool IsProbablyExecutableCode(void *addr) {
   bool match3 = (bytes[0] == 0x40 && bytes[1] == 0x53);
   bool match4 = (bytes[0] == 0x48 && bytes[1] == 0x89);
   bool match5 = (bytes[0] == 0xE9);
-  return match1 || match2 || match3 || match4 || match5;
+  bool leaf = bytes[0] == 0x48 && (bytes[1] == 0x63 || bytes[1] == 0x8D);
+  return match1 || match2 || match3 || match4 || match5 || leaf;
 }
 
 
@@ -140,6 +138,10 @@ void __fastcall Detour_CG_DrawHudElem(uintptr_t rcx, uintptr_t rdx,
   const bool hasObj =
       g_hasObjSuppressed.load(std::memory_order_relaxed);
   const bool hasTS = g_TimeScriptPersistSuppress.active;
+  // Detection alone must not hide the native digits. Wait until the overlay
+  // has a fresh, computed countdown (including its number).
+  const bool hasTimerReplacement =
+      hasTS && TextHook_HasTimeScriptTimerReplacement();
 
   if (hasObj || hasTS) {
     // --- Objective suppress: x = +9999 (scan rcx/rdx) ---
@@ -223,7 +225,7 @@ void __fastcall Detour_CG_DrawHudElem(uintptr_t rcx, uintptr_t rdx,
               LogToFile(_dm);
             }
           }
-        } else {
+        } else if (hasTimerReplacement) {
           // Suppress regardless of current type.  During SATFARM cutscenes
           // the timer HudElem type switches from TIMER_DOWN(5) to TEXT(1)
           // or TIMER_UP(4) for extended periods while the slot is still
@@ -234,7 +236,8 @@ void __fastcall Detour_CG_DrawHudElem(uintptr_t rcx, uintptr_t rdx,
         }
       }
       // Companion: timer-value HudElem sharing the same countdown end time.
-      else if (g_TimeScriptPersistSuppress.cachedTimeField > 30000) {
+      else if (hasTimerReplacement &&
+               g_TimeScriptPersistSuppress.cachedTimeField > 30000) {
         uint32_t timeField = *(volatile uint32_t *)(elemPtr + 0x78);
         if (timeField == g_TimeScriptPersistSuppress.cachedTimeField) {
           *(volatile uint32_t *)(elemPtr + 0x04) = offBits;  // x=9999
@@ -317,11 +320,13 @@ void __fastcall Detour_CG_DrawHudElem(uintptr_t rcx, uintptr_t rdx,
         if (TryReadIntroU32(elemPtr, 0x78, tf) && tf > 30000) {
           g_TimeScriptPersistSuppress.cachedTimeField = tf;
         }
-        // Apply suppression immediately this frame
+        // Keep native digits while the newly registered timer is being found.
         static const float kOff = 9999.0f;
         uint32_t offBits;
         memcpy(&offBits, &kOff, sizeof(uint32_t));
-        *(volatile uint32_t *)(elemPtr + 0x04) = offBits;
+        if (TextHook_HasTimeScriptTimerReplacement()) {
+          *(volatile uint32_t *)(elemPtr + 0x04) = offBits;
+        }
 
         static DWORD s_lastAutoRegLog = 0;
         DWORD _tnow = GetTickCount();
@@ -437,9 +442,9 @@ static bool IsCenterHudHintAuthorityCaller(unsigned int callerOffset) {
   // writer(+0x5DC950) -> update/draw(+0x1F1762)
   // prompt producer(+0x204816)
   // plus short-lived feeder callers observed in the same lifecycle.
-  return (callerOffset == 0x1F1762 || callerOffset == 0x204816 ||
-          callerOffset == 0x34A835 ||
-          callerOffset == 0x3D4B04 || callerOffset == 0x272ABB);
+  return (callerOffset == IW6Offsets::Profile::Rva_232562 || callerOffset == IW6Offsets::Profile::Rva_2454FC ||
+          callerOffset == IW6Offsets::Profile::Rva_389BB5 ||
+          callerOffset == IW6Offsets::Profile::Rva_4156EC || callerOffset == IW6Offsets::Profile::Rva_2B1453);
 }
 
 static bool ShouldForceCenterAlignGameplayTranslation(const std::string &key,
@@ -561,10 +566,10 @@ static LONG CALLBACK HudHintWriterVehHandler(PEXCEPTION_POINTERS ep) {
   const uint32_t low16 = (uint32_t)(newValue & 0xFFFFu);
   const bool likelyHudHintId = (low16 >= 0x6800u && low16 <= 0x7900u);
   const bool chainCaller =
-      (ret0Off == 0x5DD45Fu || ret0Off == 0x5DB732u || ret0Off == 0x5DBB01u ||
-       ret0Off == 0x5DC13Fu || ret0Off == 0x5DC266u || ret0Off == 0x5DC637u ||
-       ret1Off == 0x5DD45Fu || ret1Off == 0x5DB732u || ret1Off == 0x5DBB01u ||
-       ret1Off == 0x5DC13Fu || ret1Off == 0x5DC266u || ret1Off == 0x5DC637u);
+      (ret0Off == IW6Offsets::Profile::Rva_5DD45F || ret0Off == IW6Offsets::Profile::Rva_5DB732 || ret0Off == IW6Offsets::Profile::Rva_5DBB01 ||
+       ret0Off == IW6Offsets::Profile::Rva_5DC13F || ret0Off == IW6Offsets::Profile::Rva_5DC266 || ret0Off == IW6Offsets::Profile::Rva_5DC637 ||
+       ret1Off == IW6Offsets::Profile::Rva_5DD45F || ret1Off == IW6Offsets::Profile::Rva_5DB732 || ret1Off == IW6Offsets::Profile::Rva_5DBB01 ||
+       ret1Off == IW6Offsets::Profile::Rva_5DC13F || ret1Off == IW6Offsets::Profile::Rva_5DC266 || ret1Off == IW6Offsets::Profile::Rva_5DC637);
 
   const unsigned long hits = g_HudHintWriterBpHitCount.fetch_add(1) + 1;
   const DWORD now = GetTickCount();
@@ -646,7 +651,7 @@ static bool TryInstallHudHintWriterBreakpoint(uintptr_t moduleBase) {
     return g_HudHintWriterBpInstalled;
   }
 
-  g_HudHintWriterBpAddr = moduleBase + 0x5DC950;
+  g_HudHintWriterBpAddr = moduleBase + IW6Offsets::Profile::Rva_5DC950;
   if (!IsSafeRead((void *)g_HudHintWriterBpAddr, 4)) {
     return false;
   }
@@ -1020,10 +1025,10 @@ unsigned int __fastcall Detour_ConfigString_IndexToSlc(unsigned int queryIdx) {
           (ObjRev_IsObjectiveAuthoritySlcCaller(callerOffset) ||
            ObjRev_IsObjectiveConsumerCandidateCaller(callerOffset));
       const bool isHudHintCfgCaller =
-          (callerOffset == 0x204816 || callerOffset == 0x1F1762 ||
-           callerOffset == 0x34A835 || callerOffset == 0x3D4B04 ||
-           callerOffset == 0x272ABB || callerOffset == 0x491890 ||
-           callerOffset == 0x3298C2);
+          (callerOffset == IW6Offsets::Profile::Rva_2454FC || callerOffset == IW6Offsets::Profile::Rva_232562 ||
+           callerOffset == IW6Offsets::Profile::Rva_389BB5 || callerOffset == IW6Offsets::Profile::Rva_4156EC ||
+           callerOffset == IW6Offsets::Profile::Rva_2B1453 || callerOffset == IW6Offsets::Profile::Rva_4DAC50 ||
+           callerOffset == IW6Offsets::Profile::Rva_369002);
       const bool shouldAttemptDirectDecode =
           ((!osrevOnly && isObjectiveCfgCaller) || isHudHintCfgCaller) &&
           !isBroadCfgProducerCaller;
@@ -2415,8 +2420,8 @@ const char *__fastcall Detour_SL_ConvertToString(unsigned int stringValue) {
     }
     if (!isHudKey && !isIntroKeyName) {
       const bool trustedHintCaller =
-          (callerOffset == 0x32EE82 || callerOffset == 0x204816 ||
-           callerOffset == 0x3298C2);
+          (callerOffset == IW6Offsets::Profile::Rva_3720F2 || callerOffset == IW6Offsets::Profile::Rva_2454FC ||
+           callerOffset == IW6Offsets::Profile::Rva_369002);
       if (trustedHintCaller) {
         std::string autoReason;
         if (IsGameplayHudKeyName(keyCandidate, &autoReason)) {
@@ -3260,9 +3265,9 @@ const char *__fastcall Detour_SL_ConvertToString(unsigned int stringValue) {
       }
 
       const bool missionPromptReverseCaller =
-          (callerOffset == 0x1F1762 || callerOffset == 0x328E42 ||
-           callerOffset == 0x34A835 || callerOffset == 0x3D4B04 ||
-           callerOffset == 0x272ABB);
+          (callerOffset == IW6Offsets::Profile::Rva_232562 || callerOffset == IW6Offsets::Profile::Rva_3680B2 ||
+           callerOffset == IW6Offsets::Profile::Rva_389BB5 || callerOffset == IW6Offsets::Profile::Rva_4156EC ||
+           callerOffset == IW6Offsets::Profile::Rva_2B1453);
       if (missionPromptHintKey && !slcHasRenderParams &&
           (missionPromptLike || missionPromptReverseCaller)) {
         static std::mutex s_mpProbeMtx;
@@ -3715,11 +3720,11 @@ const char *__fastcall Detour_SL_ConvertToString(unsigned int stringValue) {
       // is CORNERED_* (gameplay-only, not used in menus).
       static std::mutex s_slcHintCallerMtx;
       static std::unordered_set<uintptr_t> s_slcHintCallers = {
-          0x32EE82, // Hints
-          0x204816, // Prompts
-          0x3298C2, // Platform prompts
-          0x34A835, // Mission prompt path variant
-          0x328E42  // Mission prompt path variant
+          IW6Offsets::Profile::Rva_3720F2, // Hints
+          IW6Offsets::Profile::Rva_2454FC, // Prompts
+          IW6Offsets::Profile::Rva_369002, // Platform prompts
+          IW6Offsets::Profile::Rva_389BB5, // Mission prompt path variant
+          IW6Offsets::Profile::Rva_3680B2  // Mission prompt path variant
       };
       bool isHintCaller = false;
       const bool seededHintCaller =
@@ -4917,9 +4922,13 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
                            ? s_SplitCdXScale
                            : 1.0f);
 
+            // A label-only snapshot must receive the native number before
+            // this draw is suppressed. Keep updating on subsequent draws.
+            TextHook_TimeScriptCaptureRenderedTimer(tailCandidate, s_SplitCdKey);
+
             // Only queue Korean overlay if the IAR-direct path isn't
             // already rendering for this key (prevents duplicate text).
-            if (!g_TimeScriptRuntimeState.renderSnapshot.active ||
+            if (!TextHook_HasTimeScriptTimerReplacement() ||
                 g_TimeScriptRuntimeState.renderSnapshot.key != s_SplitCdKey) {
               QueueHudScriptCountdownOverlay(
                   match, s_SplitCdLabelX, s_SplitCdLabelY, cdScale,
@@ -5050,29 +5059,8 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
 #endif
 
   // --- [1] Ghost Text Suppression (Houston subtitle in menu) ---
-  // Memory addresses for menu detection (from PROJECT_HANDOVER.md)
-  static uintptr_t base = (uintptr_t)GetModuleHandle(NULL);
-  static unsigned char *menuFlag1 = (unsigned char *)(base + 0x561F69B);
-  static unsigned char *menuFlag2 = (unsigned char *)(base + 0x561F803);
-  static unsigned char *menuFlag3 = (unsigned char *)(base + 0x561FAF3);
-  // Additional scroll menu addresses
-  static unsigned char *scrollMenuFlag = (unsigned char *)(base + 0x140E2DC);
-  static unsigned char *menuLayerFlag = (unsigned char *)(base + 0x140E2E4);
-
-  // Check if ANY menu is active
-  auto IsMenuActive = [&]() -> bool {
-    if (menuFlag1 && *menuFlag1 >= 1)
-      return true;
-    if (menuFlag2 && *menuFlag2 >= 1)
-      return true;
-    if (menuFlag3 && *menuFlag3 >= 1)
-      return true;
-    if (scrollMenuFlag && *scrollMenuFlag >= 1)
-      return true;
-    if (menuLayerFlag && *menuLayerFlag >= 1)
-      return true;
-    return false;
-  };
+  // Raw legacy flags were unverified. Menu keywords below establish state.
+  auto IsMenuActive = []() -> bool { return false; };
 
   // Track menu state globally. IMPORTANT: raw menu flags can be noisy (stuck ON),
   // so only allow them to *extend* menu state if we recently saw strong menu text.
@@ -5332,7 +5320,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
           g_creditsSoftGuard.load(std::memory_order_relaxed)) break; }
     static uintptr_t s_modBase = (uintptr_t)GetModuleHandleA(NULL);
     static std::mutex s_addcmdCallerMtx;
-    static std::unordered_set<uintptr_t> s_trustedHudCallers = {0x23EF87};
+    static std::unordered_set<uintptr_t> s_trustedHudCallers = {IW6Offsets::Profile::Rva_27DF17};
 
     std::string rawText(text);
     uintptr_t addcmdCallerOffset = (uintptr_t)_ReturnAddress() - s_modBase;
@@ -8739,7 +8727,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
   // (post-decryption / after loading). Keep this thread alive long enough to
   // observe that transition; otherwise HUD native capture silently never enables.
   const bool needHudDrawHook = TextHook_IsHudNativeEnabled();
-  const bool needTimeScriptHook = TextHook_IsHudNativeEnabled();
+  const bool needTimeScriptHook = false; // Legacy target was mid-function, not a callable ABI.
   const int kMaxIters = needHudDrawHook ? 600 : 120; // 5min vs 1min (500ms sleep)
 
   for (int i = 0; i < kMaxIters; i++) {
@@ -8751,12 +8739,14 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
         g_CG_GameMessage_TargetAddr != nullptr;
 
     // Late-bind R_TextWidth when IW6 code becomes executable (decrypted).
-    if (!g_R_TextWidth) {
+    if (!g_R_TextWidth.load(std::memory_order_acquire)) {
       if (IsProbablyExecutableCode(g_R_TextWidthAddrPrimary)) {
-        g_R_TextWidth = (R_TextWidth_t)g_R_TextWidthAddrPrimary;
+        g_R_TextWidth.store((R_TextWidth_t)g_R_TextWidthAddrPrimary,
+                            std::memory_order_release);
         LogToFile("[TextHook] R_TextWidth became ready (primary).");
       } else if (IsProbablyExecutableCode(g_R_TextWidthAddrFallback)) {
-        g_R_TextWidth = (R_TextWidth_t)g_R_TextWidthAddrFallback;
+        g_R_TextWidth.store((R_TextWidth_t)g_R_TextWidthAddrFallback,
+                            std::memory_order_release);
         LogToFile("[TextHook] R_TextWidth became ready (fallback).");
       }
     }
@@ -8865,52 +8855,9 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
     // the function prologue (CC padding), then hook it.
     if (!g_CG_DrawHudElem_Hooked && seh_hooked) {
       static uintptr_t s_cgDrawHudElemAddr = 0;
-      if (s_cgDrawHudElemAddr == 0) {
-        // The call site RVA 0x1F087D is inside CG_DrawHudElem.
-        // NOTE: Use VirtualQuery (not IsProbablyExecutableCode) because
-        // 0x1F087D is mid-function — its bytes won't match a prologue.
-        uintptr_t moduleBase = (uintptr_t)GetModuleHandleA(NULL);
-        uintptr_t callSite = moduleBase + 0x1F087D;
-        MEMORY_BASIC_INFORMATION mbi = {};
-        bool isExecutable = false;
-        if (VirtualQuery((void *)callSite, &mbi, sizeof(mbi)) != 0 &&
-            mbi.State == MEM_COMMIT) {
-          DWORD p = mbi.Protect & 0xFF;
-          isExecutable = (p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ ||
-                          p == PAGE_EXECUTE_READWRITE ||
-                          p == PAGE_EXECUTE_WRITECOPY);
-        }
-        if (isExecutable) {
-          uintptr_t funcStart = ScanBackForFunctionStart(callSite);
-          if (funcStart != 0) {
-            s_cgDrawHudElemAddr = funcStart;
-            uintptr_t rva = funcStart - moduleBase;
-            unsigned char *fb = (unsigned char *)funcStart;
-            char buf[320];
-            sprintf_s(buf,
-                      "[TextHook] CG_DrawHudElem found at RVA 0x%llX "
-                      "(scan from 0x1F087D, dist=%lld), prologue: "
-                      "%02X %02X %02X %02X %02X %02X %02X %02X "
-                      "%02X %02X %02X %02X %02X %02X %02X %02X",
-                      (unsigned long long)rva,
-                      (long long)(callSite - funcStart),
-                      fb[0], fb[1], fb[2], fb[3], fb[4], fb[5],
-                      fb[6], fb[7], fb[8], fb[9], fb[10], fb[11],
-                      fb[12], fb[13], fb[14], fb[15]);
-            LogToFile(buf);
-          } else {
-            // Log a few bytes around callSite for debugging.
-            unsigned char *cs = (unsigned char *)callSite;
-            char buf[256];
-            sprintf_s(buf,
-                      "[TextHook] CG_DrawHudElem: CC-scan failed from "
-                      "0x1F087D. Bytes[-8..+3]: %02X %02X %02X %02X "
-                      "%02X %02X %02X %02X | %02X %02X %02X",
-                      cs[-8], cs[-7], cs[-6], cs[-5], cs[-4], cs[-3],
-                      cs[-2], cs[-1], cs[0], cs[1], cs[2]);
-            LogToFile(buf);
-          }
-        }
+      if (s_cgDrawHudElemAddr == 0 && GameBuild::RuntimeReady()) {
+        // Exact function boundary verified from both stock runtime captures.
+        s_cgDrawHudElemAddr = (uintptr_t)GetModuleHandleW(nullptr) + IW6Offsets::CG_DrawHudElem_SP;
       }
       if (s_cgDrawHudElemAddr != 0 && !g_CG_DrawHudElem_Hooked) {
         CreateHook((void *)s_cgDrawHudElemAddr,
@@ -9339,8 +9286,8 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
 
       // === PHASE 1: Dump prologues of key functions (64 bytes each) ===
       {
-        uintptr_t fnOffsets[] = {0x1F9400, 0x3FE560, 0x3F4A70, 0x1FC990,
-                                 0x3F3DE0, 0x2349D0, 0x1F1740, 0x416AE0};
+        uintptr_t fnOffsets[] = {IW6Offsets::Profile::Rva_1F9400, IW6Offsets::HUD_DrawText_SP, IW6Offsets::TextFxRender_SP, IW6Offsets::Profile::Rva_1FC990,
+                                 IW6Offsets::IntroTextLayout_SP, IW6Offsets::ConfigStringWrapper_SP, IW6Offsets::IntroRender_SP, IW6Offsets::IntroActualRender_SP};
         const char *fnNames[] = {
             "ParentHudRender(0x1F9400)",
             "HUD_DrawText(0x3FE560)",
@@ -9371,15 +9318,15 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
         // Subtitle reverse candidates from runtime SEH-SUB stack traces.
         // Goal: identify the subtitle queue/remove lifecycle without blind hooks.
         uintptr_t subRevOffsets[] = {
-            0x2351E0, // callsite container for SEH subtitle lookups (call=+0x235210)
-            0x235620, // called by 0x2351E0 with localized text pointer
-            0x2417E0, // pre-check call inside 0x2351E0
-            0x1F622C, // upper caller from stack traces
-            0x580D53, // script/flow side frame (changes by context)
-            0x3E85AB, // script/flow side frame (changes by context)
-            0x589C31, // branch frame near subtitle events
-            0x241830, // branch frame near subtitle events
-            0x204C33  // large frame containing +0x204EE0 path
+            IW6Offsets::SubtitleWrapper_SP, // callsite container for SEH subtitle lookups (call=+0x235210)
+            IW6Offsets::SubtitleEnqueue_SP, // called by 0x2351E0 with localized text pointer
+            IW6Offsets::SubtitlePrecheck_SP, // pre-check call inside 0x2351E0
+            IW6Offsets::Profile::Rva_1F622C, // upper caller from stack traces
+            IW6Offsets::Profile::Rva_580D53, // script/flow side frame (changes by context)
+            IW6Offsets::Profile::Rva_3E85AB, // script/flow side frame (changes by context)
+            IW6Offsets::Profile::Rva_589C31, // branch frame near subtitle events
+            IW6Offsets::SubtitleBranch_SP, // branch frame near subtitle events
+            IW6Offsets::Profile::Rva_204C33  // large frame containing +0x204EE0 path
         };
         const char *subRevNames[] = {
             "SubRev_CallsiteFn(0x2351E0)",
@@ -9405,7 +9352,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
 
         // Hook subtitle wrapper (+0x2351E0) to capture enqueue-time parameters.
         if (!g_SubtitleWrap2351E0_Hooked) {
-          uintptr_t subWrapAddr = mb + 0x2351E0;
+          uintptr_t subWrapAddr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(mb, IW6Offsets::SubtitleWrapper_SP));
           unsigned char *subWrapBytes = (unsigned char *)subWrapAddr;
           if (!IsBadReadPtr(subWrapBytes, 16)) {
             // Expected prologue:
@@ -9438,7 +9385,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
 
         // Hook enqueue candidate (+0x235620) to capture lifecycle args.
         if (!g_SubtitleEnqueue235620_Hooked) {
-          uintptr_t subEnqAddr = mb + 0x235620;
+          uintptr_t subEnqAddr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(mb, IW6Offsets::SubtitleEnqueue_SP));
           unsigned char *subEnqBytes = (unsigned char *)subEnqAddr;
           if (!IsBadReadPtr(subEnqBytes, 16)) {
             bool ok = (subEnqBytes[0] == 0x40 || subEnqBytes[0] == 0x48 ||
@@ -9482,7 +9429,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
       // removed - all fully analyzed as of 2026-02-09
 
       // Hook 0x1FC8B0 with pre-stub for register capture
-      g_HTR_Addr = (void *)(mb + 0x1FC8B0);
+      g_HTR_Addr = (void *)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(mb, IW6Offsets::HudTextRender_SP)));
       g_HTR_PreStub = VirtualAlloc(NULL, 128, MEM_COMMIT | MEM_RESERVE,
                                    PAGE_EXECUTE_READWRITE);
       if (g_HTR_PreStub) {
@@ -9552,7 +9499,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
     // === IntroTextLayout Hook (0x3F3DE0) - Intro/chyron text rendering ===
     if (!g_ITL_Hooked && g_SLC_HookApplied) {
       uintptr_t itlBase = (uintptr_t)GetModuleHandleA(NULL);
-      uintptr_t itlAddr = itlBase + 0x3F3DE0;
+      uintptr_t itlAddr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(itlBase, IW6Offsets::IntroTextLayout_SP));
       unsigned char *itlBytes = (unsigned char *)itlAddr;
 
       // Verify prologue matches expected bytes
@@ -9588,7 +9535,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
     // === IntroRenderFn Hook (0x1F1740) - Captures render context arg3 ===
     if (!g_IRF_Hooked && g_ITL_Hooked) {
       uintptr_t irfBase = (uintptr_t)GetModuleHandleA(NULL);
-      uintptr_t irfAddr = irfBase + 0x1F1740;
+      uintptr_t irfAddr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(irfBase, IW6Offsets::IntroRender_SP));
       unsigned char *irfBytes = (unsigned char *)irfAddr;
 
       // Verify prologue: 48 89 5c 24 08 = MOV [RSP+8], RBX
@@ -9612,7 +9559,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
           // 0x416AE0 receives (type, layoutResult, renderCtx, count)
           // and is the REAL rendering function. Scan it for E8/E9/FF15.
           {
-            unsigned char *fnStart = (unsigned char *)(irfBase + 0x416AE0);
+            unsigned char *fnStart = (unsigned char *)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(irfBase, IW6Offsets::IntroActualRender_SP)));
             const int scanLen = 4096;
             int callCount = 0;
             LogToFile("[SCAN416] Scanning IntroActualRender (0x416AE0)...");
@@ -9684,7 +9631,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
           }
 
           if (!g_IAR_Hooked) {
-            uintptr_t iarAddr = irfBase + 0x416AE0;
+            uintptr_t iarAddr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(irfBase, IW6Offsets::IntroActualRender_SP));
             unsigned char *iarBytes = (unsigned char *)iarAddr;
             const bool introActualRenderPrologueOk =
                 iarBytes[0] == 0x48 && iarBytes[1] == 0x89 &&
@@ -9727,7 +9674,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
           // Safe area calculation is INSIDE this function.
           // Dump 1024 bytes + scan for MULSS/ADDSS/CALL patterns.
           {
-            unsigned char *vpStart = (unsigned char *)(irfBase + 0x1F0CE0);
+            unsigned char *vpStart = (unsigned char *)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(irfBase, IW6Offsets::IntroSubRender_SP)));
             LogToFile("[HEXVP] Dumping 0x1F0CE0 (ViewportSetup)...");
             int vpLen = 1024;
             for (int row = 0; row < vpLen; row += 32) {
@@ -9830,7 +9777,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
     // heavy log/CPU overhead.
     if (false && !g_IRFSub1_Hooked && g_IRF_Hooked) {
       uintptr_t sub1Base = (uintptr_t)GetModuleHandleA(NULL);
-      uintptr_t sub1Addr = sub1Base + 0x1F0CE0;
+      uintptr_t sub1Addr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(sub1Base, IW6Offsets::IntroSubRender_SP));
       unsigned char *sub1Bytes = (unsigned char *)sub1Addr;
 
       // Log prologue for analysis
@@ -9941,7 +9888,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
     // === TimeScript HUD draw Hook (0x555EA0) - dedicated countdown HUD ===
     if (needTimeScriptHook && !g_TimeScriptHooked) {
       const uintptr_t tsBase = (uintptr_t)GetModuleHandleA(NULL);
-      const uintptr_t tsAddr = tsBase + 0x555EA0;
+      const uintptr_t tsAddr = tsBase + IW6Offsets::Profile::Rva_555EA0;
       if (!IsProbablyExecutableCode((void *)tsAddr)) {
         static DWORD s_lastTimeScriptDefer = 0;
         const DWORD nowDefer = GetTickCount();
@@ -10077,7 +10024,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
     // whenever the function body becomes executable.
     if (!g_HDT_Hooked) {
       uintptr_t hdtBase = (uintptr_t)GetModuleHandleA(NULL);
-      uintptr_t hdtAddr = hdtBase + 0x3FE560;
+      uintptr_t hdtAddr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(hdtBase, IW6Offsets::HUD_DrawText_SP));
       unsigned char *hdtBytes = (unsigned char *)hdtAddr;
 
       if (!IsProbablyExecutableCode((void *)hdtAddr)) {
@@ -10117,6 +10064,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
 
     // All core hooks applied
     if (r_addcmd_hooked && seh_hooked && g_SLC_HookApplied &&
+        g_R_TextWidth.load(std::memory_order_acquire) &&
         g_CfgToSlc_HookApplied && g_SL_StringTypeCheck_HookApplied &&
         (!cgMsgHookNeeded || g_CG_GameMessage_HookApplied) &&
         (!needHudDrawHook || g_HDT_Hooked) &&
@@ -10152,6 +10100,9 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
   if (!seh_hooked) {
     LogToFile("[TextHook] Timeout! SEH hook not applied.");
   }
+  if (!g_R_TextWidth.load(std::memory_order_acquire)) {
+    LogToFile("[TextHook] Timeout! Native text width function not ready.");
+  }
   if (!g_SLC_HookApplied) {
     LogToFile("[TextHook] Timeout! SLC hook not applied.");
   }
@@ -10168,7 +10119,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
   if (TextHook_IsHudNativeEnabled() && !g_HDT_Hooked) {
     LogToFile("[TextHook] Timeout! HUD_DrawText hook not applied.");
   }
-  if (TextHook_IsHudNativeEnabled() && !g_TimeScriptHooked) {
+  if (false && TextHook_IsHudNativeEnabled() && !g_TimeScriptHooked) {
     LogToFile("[TextHook] Timeout! TimeScript HUD draw hook not applied.");
   }
   // OSREV chain hook timeout checks removed — OSAUTH is the sole authority.
@@ -10176,6 +10127,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
   return 1;
 }
 void TextHook::Init() {
+  if (!GameBuild::RuntimeReady()) return;
   static std::atomic<int> s_InitState{
       0}; // 0=not started, 1=initializing, 2=initialized
 
@@ -10241,7 +10193,7 @@ void TextHook::Init() {
     // Default OFF: INT3 writer breakpoint is very expensive in normal gameplay
     // and should only be enabled for explicit reverse sessions.
     g_HudHintWriterBpEnabled =
-        ParseEnvFlag("GHOSTSKOR_HUDHINT_WRITER_BP", false);
+        false; // Requires a separately validated instruction/context for this build.
     if (g_HudHintWriterBpEnabled) {
       LogToFile("[HUDW-BP] enabled (INT3@+0x5DC950)");
     } else {
@@ -10306,15 +10258,18 @@ void TextHook::Init() {
   g_R_TextWidthAddrFallback =
       IW6Offsets::GetAddress(moduleBase, IW6Offsets::R_TextWidth_SP_FALLBACK);
 
-  g_R_TextWidth = nullptr;
+  g_R_TextWidth.store(nullptr, std::memory_order_release);
   if (IsProbablyExecutableCode(g_R_TextWidthAddrPrimary)) {
-    g_R_TextWidth = (R_TextWidth_t)g_R_TextWidthAddrPrimary;
+    g_R_TextWidth.store((R_TextWidth_t)g_R_TextWidthAddrPrimary,
+                        std::memory_order_release);
   } else if (IsProbablyExecutableCode(g_R_TextWidthAddrFallback)) {
-    g_R_TextWidth = (R_TextWidth_t)g_R_TextWidthAddrFallback;
+    g_R_TextWidth.store((R_TextWidth_t)g_R_TextWidthAddrFallback,
+                        std::memory_order_release);
   }
-  if (g_R_TextWidth) {
+  const auto nativeTextWidth = g_R_TextWidth.load(std::memory_order_acquire);
+  if (nativeTextWidth) {
     LogToFile("[TextHook] R_TextWidth initialized at: " +
-              std::to_string(reinterpret_cast<uintptr_t>(g_R_TextWidth)));
+              std::to_string(reinterpret_cast<uintptr_t>(nativeTextWidth)));
   } else {
     LogToFile("[TextHook] WARNING: R_TextWidth not ready (will retry).");
   }

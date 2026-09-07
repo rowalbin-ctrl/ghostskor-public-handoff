@@ -69,10 +69,13 @@
         const std::string finalRenderText =
             timeScriptSnapshot.renderText + timerBuf;
 
+        // TimeScript snapshots carry logical 1080p font heights, unlike the
+        // pixel heights supplied by the general HUD layout adapter.
+        const float timerResolutionScale = g_ActiveArea.height / 1080.0f;
         // Measure final composite width for right-alignment positioning
         float englishWidth = KoreanRenderer::MeasureTextWidthEx(
             finalRenderText, timeScriptSnapshot.fontHeight,
-            timeScriptSnapshot.scale, 0);
+            timeScriptSnapshot.scale, 0, timerResolutionScale);
         if (!(englishWidth > 1.0f)) {
           englishWidth = 300.0f;  // fallback
         }
@@ -94,7 +97,8 @@
             timeScriptSnapshot.color, timeScriptSnapshot.fontHeight, 0,
             englishWidth, false, false, timeScriptSnapshot.scale, false, false,
             true, timeScriptSnapshot.forceAlign, 0.0f, false,
-            timeScriptSnapshot.yIsTopOfText, 0, &stylePatch);
+            timeScriptSnapshot.yIsTopOfText, 0, &stylePatch,
+            timerResolutionScale);
 
         static DWORD s_lastTimeScriptRenderLog = 0;
         if ((now - s_lastTimeScriptRenderLog) > 900) {

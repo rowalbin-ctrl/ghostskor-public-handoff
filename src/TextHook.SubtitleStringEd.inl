@@ -71,7 +71,7 @@ uintptr_t __fastcall Detour_SubtitleEnqueue235620(int a1, int windowId,
   uintptr_t caller = (uintptr_t)_ReturnAddress();
   uintptr_t callerOff =
       (base && caller >= base) ? (caller - base) : (uintptr_t)0;
-  bool fromSubWrap = (callerOff >= 0x235220 && callerOff <= 0x235280);
+  bool fromSubWrap = (callerOff >= IW6Offsets::SubtitleWrapper_SP && callerOff < IW6Offsets::Profile::Rva_273F0A);
 
   // === PROBE Phase 9: Dereference slot pointers to find subtitle text ===
   // Slots at base+0x1640738 contain 3 pointers each (ptr1, ptr2, ptr3)
@@ -82,7 +82,7 @@ uintptr_t __fastcall Detour_SubtitleEnqueue235620(int a1, int windowId,
         localizedText[0]) {
       s_phase9Count++;
       for (int line = 0; line < 3; line++) {
-        uintptr_t slotAddr = base + 0x1640738 + (uintptr_t)(line * 64);
+        uintptr_t slotAddr = base + IW6Offsets::Profile::Rva_17BF4B8 + (uintptr_t)(line * 64);
         if (IsSafeRead((void *)slotAddr, 24)) {
           // Read the 3 pointers from the slot
           uintptr_t ptr1 = *(uintptr_t *)(slotAddr);
@@ -358,7 +358,7 @@ unsigned long TextHook_GetSubtitleClockNow() {
     s_moduleBase = (uintptr_t)GetModuleHandleA(NULL);
   }
   if (s_moduleBase && !s_findVar && IW6Offsets::Dvar_FindVar_SP != 0) {
-    s_findVar = (Dvar_FindVar_t)(s_moduleBase + IW6Offsets::Dvar_FindVar_SP);
+    s_findVar = (Dvar_FindVar_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(s_moduleBase, IW6Offsets::Dvar_FindVar_SP)));
   }
 
   // Resolve dvar pointers lazily (dvar system may not be ready at early init).
@@ -2552,13 +2552,16 @@ LastSubtitleDiag TextHook_GetLastSubtitleDiag() {
   return g_LastSubtitleDiag;
 }
 static void DumpSubtitleDvarCandidates(const char *phaseTag) {
+#if GHOSTSKOR_RUNTIME_DIAG
+  // Logging being disabled must also disable the engine calls made solely
+  // for diagnostics. A no-op LogToFile does not remove those side effects.
   typedef void *(*Dvar_FindVar_t)(const char *name);
   uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
   if (!base)
     return;
 
   Dvar_FindVar_t findVar =
-      (Dvar_FindVar_t)(base + IW6Offsets::Dvar_FindVar_SP);
+      (Dvar_FindVar_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(base, IW6Offsets::Dvar_FindVar_SP)));
   if (!findVar) {
     LogToFile("[SUBDVAR] Dvar_FindVar unresolved");
     return;
@@ -2690,6 +2693,9 @@ static void DumpSubtitleDvarCandidates(const char *phaseTag) {
   sprintf_s(end, "[SUBDVAR] END phase=%s",
             (phaseTag && phaseTag[0]) ? phaseTag : "?");
   LogToFile(end);
+#else
+  (void)phaseTag;
+#endif
 }
 static void DumpSubtitleDvarCandidatesEarlyOnce() {
   static bool s_done = false;
@@ -2715,7 +2721,7 @@ bool TextHook_TryGetDvarVec4(const char *name, float out[4]) {
     return false;
 
   Dvar_FindVar_t findVar =
-      (Dvar_FindVar_t)(base + IW6Offsets::Dvar_FindVar_SP);
+      (Dvar_FindVar_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(base, IW6Offsets::Dvar_FindVar_SP)));
   if (!findVar)
     return false;
 
@@ -2757,15 +2763,15 @@ bool TextHook_TryGetDvarInt(const char *name, int &outValue) {
 
   Dvar_GetInt_t getInt = nullptr;
   if (IW6Offsets::Dvar_GetInt_SP != 0) {
-    getInt = (Dvar_GetInt_t)(base + IW6Offsets::Dvar_GetInt_SP);
+    getInt = (Dvar_GetInt_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(base, IW6Offsets::Dvar_GetInt_SP)));
   }
   Dvar_GetVariantStringWithDefault_t getVariantString = nullptr;
   if (IW6Offsets::Dvar_GetVariantStringWithDefault_SP != 0) {
     getVariantString = (Dvar_GetVariantStringWithDefault_t)(
-        base + IW6Offsets::Dvar_GetVariantStringWithDefault_SP);
+        reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(base, IW6Offsets::Dvar_GetVariantStringWithDefault_SP)));
   }
   Dvar_FindVar_t findVar =
-      (Dvar_FindVar_t)(base + IW6Offsets::Dvar_FindVar_SP);
+      (Dvar_FindVar_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(base, IW6Offsets::Dvar_FindVar_SP)));
   if (!findVar)
     return false;
 

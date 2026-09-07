@@ -2547,7 +2547,7 @@ bool TextHook_PromoteStrictHintSnapshotByCfg(uint32_t textCfg,
       std::isfinite(nx) && nx >= -160.0f && nx <= 160.0f;
   const bool maybeCenterRelativeY =
       std::isfinite(ny) && ny >= -240.0f && ny <= 160.0f;
-  if ((horzAlign != 0 || vertAlign != 0 || callerOffset == 0x1F087D) &&
+  if ((horzAlign != 0 || vertAlign != 0 || callerOffset == IW6Offsets::Profile::Rva_2316DB) &&
       maybeCenterRelativeX && maybeCenterRelativeY) {
     nx += 320.0f;
     ny += 240.0f;

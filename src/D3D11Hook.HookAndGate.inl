@@ -43,6 +43,8 @@ extern std::atomic<bool> g_bDXGIWrapperActive;
 
 HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain *pSwapChain,
                                        UINT SyncInterval, UINT Flags) {
+  if (!GameBuild::RuntimeReady())
+    return Original_Present(pSwapChain, SyncInterval, Flags);
   // 0. DXGIWrapper path is active: it owns rendering, so do not duplicate it.
   //    Hook_Present was installed on WrappedIDXGISwapChain::VTable[8], so
   //    Original_Present == WrappedIDXGISwapChain::Present which handles

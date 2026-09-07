@@ -57,7 +57,7 @@
         uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
         if (base) {
           for (int line = 0; line < 3; line++) {
-            uintptr_t slotAddr = base + 0x1640738 + (uintptr_t)(line * 64);
+            uintptr_t slotAddr = base + IW6Offsets::Profile::Rva_17BF4B8 + (uintptr_t)(line * 64);
             if (!IsSafeRead((void *)slotAddr, 64))
               continue;
             uint32_t capacity = *(uint32_t *)(slotAddr + 0x1C);

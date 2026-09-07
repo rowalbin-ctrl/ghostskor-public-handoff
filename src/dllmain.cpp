@@ -4,6 +4,7 @@
 #include "BinkHook.h"
 #include "D3D11Hook.h"
 #include "FSHook.h"
+#include "GameBuild.h"
 #include "TextHook.h"
 #include "TextReplacer.h"
 #include "TranslationStore.h"
@@ -71,6 +72,9 @@ extern "C" HRESULT WINAPI CreateDXGIFactory(REFIID riid, void **ppFactory) {
   if (!func)
     return E_FAIL;
 
+  if (!GameBuild::IsSupported() || !CanWrapFactoryRiid(riid))
+    return func(riid, ppFactory);
+
   // Wrap it
   void *pTemp = nullptr;
   HRESULT hr = func(IID_IDXGIFactory1_Local, &pTemp);
@@ -90,6 +94,9 @@ extern "C" HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **ppFactory) {
                                                      "CreateDXGIFactory1");
   if (!func)
     return E_FAIL;
+
+  if (!GameBuild::IsSupported() || !CanWrapFactoryRiid(riid))
+    return func(riid, ppFactory);
 
   void *pTemp = nullptr;
   HRESULT hr = func(riid, &pTemp);
@@ -112,7 +119,7 @@ extern "C" HRESULT WINAPI CreateDXGIFactory2(UINT Flags, REFIID riid,
   if (!ppFactory)
     return E_POINTER;
 
-  if (CanWrapFactoryRiid(riid)) {
+  if (GameBuild::IsSupported() && CanWrapFactoryRiid(riid)) {
     void *pTemp = nullptr;
     HRESULT hr = func(Flags, IID_IDXGIFactory1_Local, &pTemp);
     if (SUCCEEDED(hr) && pTemp) {
@@ -133,6 +140,18 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
 
   // Wait a tiny bit (Safety)
   Sleep(50);
+
+  if (!GameBuild::IsSupported()) {
+    GameBuild::WriteStatus("Unsupported EXE; Korean patch hooks skipped.");
+    return finish(0);
+  }
+  // Steam unpacks code after DLL loading. File identity alone is insufficient.
+  for (int i = 0; i < 600 && !GameBuild::RuntimeReady(); ++i) Sleep(50);
+  if (!GameBuild::RuntimeReady()) {
+    GameBuild::WriteStatus("Expected runtime code not ready; game hooks skipped.");
+    return finish(0);
+  }
+  GameBuild::WriteStatus("Runtime signatures verified; initializing Korean patch.");
 
   // CreateConsole();
   LogToFile("DLL Loaded. MainThread Started (Async). [FSHook+VideoSub v2]");
@@ -233,6 +252,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
   }
 
   LogToFile("[Main] All hooks initialized successfully.");
+  GameBuild::WriteStatus("Initialization dispatched; gameplay validation still required.");
   return finish(0);
 }
 

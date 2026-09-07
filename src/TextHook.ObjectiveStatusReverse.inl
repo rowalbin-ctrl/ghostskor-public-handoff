@@ -651,7 +651,7 @@ TextHook_OSAuth_RecordVisualCapture(const ObjectiveVisualCapture &capture) {
 
   bool replace = false;
   const bool introVisualPair =
-      (capture.calleeRva == 0x1F1740u && it->second.calleeRva == 0x1F1740u);
+      (capture.calleeRva == IW6Offsets::IntroRender_SP && it->second.calleeRva == IW6Offsets::IntroRender_SP);
   const DWORD introDeltaMs =
       (capture.captureTick >= it->second.captureTick)
           ? (capture.captureTick - it->second.captureTick)

@@ -7,6 +7,7 @@
 
 #include "BinkHook.h"
 #include "IW6Offsets.h"
+#include "GameBuild.h"
 
 #include "KoreanRenderer.h"
 #include "BindingResolver.h"
@@ -262,8 +263,8 @@ static std::mutex g_objSlcObsMutex;
 static std::vector<ObjSlcObservation> g_objSlcObservations;
 static std::atomic<uint32_t> g_objSlcDirectBase{0};
 // Build-stable objective producer caller pair for this binary.
-static std::atomic<uintptr_t> g_objAuthoritySlcCallerOffset{0x1F1762};
-static std::atomic<uintptr_t> g_objAuthorityTypeCheckCallerOffset{0x1F1753};
+static std::atomic<uintptr_t> g_objAuthoritySlcCallerOffset{IW6Offsets::Profile::Rva_232562};
+static std::atomic<uintptr_t> g_objAuthorityTypeCheckCallerOffset{0};
 
 static uintptr_t ObjRev_GetObjectiveAuthoritySlcCallerOffset() {
   return g_objAuthoritySlcCallerOffset.load(std::memory_order_relaxed);
@@ -291,7 +292,7 @@ static void ObjRev_UpdateObjectiveAuthorityCallers(uintptr_t typeCheckCaller,
   }
   // Structural invariant in this path:
   // cmp/typecheck return site is immediately followed by SL_ConvertToString call.
-  if ((typeCheckCaller + 0x0Fu) != slcCaller) {
+  if ((typeCheckCaller + 0x0Eu) != slcCaller) {
     return;
   }
 
@@ -362,8 +363,8 @@ static void ObjRev_UpdateObjectiveAuthorityCallers(uintptr_t typeCheckCaller,
 static const std::array<unsigned int, 8> &TextHook_GetConfirmedStatusConsumerCallers() {
   // Confirmed status consumers from runtime logs (not objective authority callsites).
   static const std::array<unsigned int, 8> kCallers = {
-      0x1F1762, 0x1480BB, 0x1481D0, 0x34A876,
-      0x204816, 0x2046EE, 0x3D4B04, 0x491890};
+      IW6Offsets::Profile::Rva_232562, IW6Offsets::Profile::Rva_18465B, IW6Offsets::Profile::Rva_18477E, IW6Offsets::Profile::Rva_389BF7,
+      IW6Offsets::Profile::Rva_2454FC, 0, IW6Offsets::Profile::Rva_4156EC, IW6Offsets::Profile::Rva_4DAC50};
   return kCallers;
 }
 
@@ -377,7 +378,7 @@ static bool TextHook_IsConfirmedStatusConsumerCaller(unsigned int callerOffset) 
 }
 
 static bool TextHook_IsPrimaryStatusProducerCaller(unsigned int callerOffset) {
-  return (callerOffset == 0x1F1762 || callerOffset == 0x491890);
+  return (callerOffset == IW6Offsets::Profile::Rva_232562 || callerOffset == IW6Offsets::Profile::Rva_4DAC50);
 }
 
 static bool TextHook_GetRecentObjectiveStatusProbeFromConsumers(
@@ -1690,7 +1691,8 @@ static bool g_CursorTextHookApplied = false;
 // R_TextWidth - Game engine function for measuring text width accurately
 typedef int(__fastcall *R_TextWidth_t)(const char *text, int maxChars,
                                        Font_s *font);
-static R_TextWidth_t g_R_TextWidth = nullptr;
+// Published by the delayed hook thread, consumed by the render thread.
+static std::atomic<R_TextWidth_t> g_R_TextWidth{nullptr};
 static void *g_R_TextWidthAddrPrimary = nullptr;
 static void *g_R_TextWidthAddrFallback = nullptr;
 
@@ -2589,19 +2591,19 @@ static bool ObjRev_IsBulkCfgProducerCaller(uintptr_t callerOffset) {
   }
   // 0x328Dxx family are high-volume cfg walkers and not objective/status
   // authority producers.
-  if ((callerOffset & 0xFFFF00u) == 0x328D00u) {
+  if ((callerOffset >= IW6Offsets::Profile::Rva_367F60 && callerOffset < IW6Offsets::Profile::Rva_3682F7)) {
     return true;
   }
   // Additional broad producer traversals observed in this build.
-  return (callerOffset == 0x147CBB || callerOffset == 0x147D8C ||
-          callerOffset == 0x147FDB);
+  return (callerOffset == IW6Offsets::Profile::Rva_18423B || callerOffset == IW6Offsets::Profile::Rva_183FEC ||
+          callerOffset == IW6Offsets::Profile::Rva_1843DB);
 }
 
 static bool ObjRev_IsObjectiveConsumerCandidateCaller(uintptr_t callerOffset) {
   // Objective consumer candidates only.
   // Broad producer/bulk traversals are filtered by
   // ObjRev_IsBulkCfgProducerCaller().
-  return (callerOffset == 0x1480BB);
+  return (callerOffset == IW6Offsets::Profile::Rva_18465B);
 }
 
 static bool ObjRev_LooksLikeConsumerLocKey(const std::string &key) {
@@ -2686,9 +2688,9 @@ static bool ObjRev_FindRecentCfgSlcTlsForSlc(uint32_t slcIdx, DWORD now,
     if (it->slcIdx == slcIdx) {
       score += 1200;
     }
-    if (it->callerOffset == 0x1480BB) {
+    if (it->callerOffset == IW6Offsets::Profile::Rva_18465B) {
       score += 220;
-    } else if (it->callerOffset == 0x1481D0) {
+    } else if (it->callerOffset == IW6Offsets::Profile::Rva_18477E) {
       score += 210;
     } else if (ObjRev_IsBulkCfgProducerCaller(it->callerOffset)) {
       score -= 120;
@@ -4594,7 +4596,7 @@ static Dvar_FindVar_t ResolveDvarFindVar() {
     s_moduleBase = (uintptr_t)GetModuleHandleA(NULL);
   }
   if (s_moduleBase && !s_findVar && IW6Offsets::Dvar_FindVar_SP != 0) {
-    s_findVar = (Dvar_FindVar_t)(s_moduleBase + IW6Offsets::Dvar_FindVar_SP);
+    s_findVar = (Dvar_FindVar_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(s_moduleBase, IW6Offsets::Dvar_FindVar_SP)));
   }
   return s_findVar;
 }
@@ -4606,7 +4608,7 @@ static Dvar_GetInt_t ResolveDvarGetInt() {
     s_moduleBase = (uintptr_t)GetModuleHandleA(NULL);
   }
   if (s_moduleBase && !s_getInt && IW6Offsets::Dvar_GetInt_SP != 0) {
-    s_getInt = (Dvar_GetInt_t)(s_moduleBase + IW6Offsets::Dvar_GetInt_SP);
+    s_getInt = (Dvar_GetInt_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(s_moduleBase, IW6Offsets::Dvar_GetInt_SP)));
   }
   return s_getInt;
 }
@@ -4950,32 +4952,9 @@ bool TextHook_IsPauseMenuLikely() {
 
 
 bool TextHook_IsMenuActiveRaw() {
-  static uintptr_t base = (uintptr_t)GetModuleHandle(NULL);
-  static unsigned char *menuFlag1 = (unsigned char *)(base + 0x561F69B);
-  static unsigned char *menuFlag2 = (unsigned char *)(base + 0x561F803);
-  static unsigned char *menuFlag3 = (unsigned char *)(base + 0x561FAF3);
-  static unsigned char *scrollMenuFlag = (unsigned char *)(base + 0x140E2DC);
-  static unsigned char *menuLayerFlag = (unsigned char *)(base + 0x140E2E4);
-
-  // IMPORTANT:
-  // These memory flags can be noisy (observed stuck ON during gameplay on some
-  // builds/missions). We gate them behind g_MenuContext which is derived from
-  // actual menu text draw calls (with a small amount of raw-flag extension).
-  if (!g_MenuContext.load()) {
-    return false;
-  }
-
-  if (menuFlag1 && *menuFlag1 >= 1)
-    return true;
-  if (menuFlag2 && *menuFlag2 >= 1)
-    return true;
-  if (menuFlag3 && *menuFlag3 >= 1)
-    return true;
-  if (scrollMenuFlag && *scrollMenuFlag >= 1)
-    return true;
-  if (menuLayerFlag && *menuLayerFlag >= 1)
-    return true;
-  return false;
+  // Menu presence is established by actual menu draw calls. The old raw
+  // flag addresses were unverified and could latch unrelated memory after an update.
+  return g_MenuContext.load();
 }
 
 static std::atomic<bool> g_MapLoaded{false};
@@ -5442,8 +5421,9 @@ static float MeasureEnglishWidthForLayout(const char *text, Font_s *font,
   }
 
   // Try native engine measurement first (fast, no character iteration).
-  if (g_R_TextWidth && font) {
-    const int nativeWidthPixels = g_R_TextWidth(text, -1, font);
+  const auto nativeTextWidth = g_R_TextWidth.load(std::memory_order_acquire);
+  if (nativeTextWidth && font) {
+    const int nativeWidthPixels = nativeTextWidth(text, -1, font);
     const float nativeWidth = (float)nativeWidthPixels * xScale;
     const bool validNativeWidth =
         (nativeWidthPixels > 0 && nativeWidthPixels != INT_MIN &&
@@ -5725,7 +5705,7 @@ static ObjRev_ConfigIndexToSlcFn ObjRev_GetConfigIndexToSlcFn() {
   }
 
   const uintptr_t off = IW6Offsets::ConfigString_IndexToSlc_SP;
-  if (off != 0 && AcceptFn(moduleBase + off, "offset")) {
+  if (off != 0 && AcceptFn(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(moduleBase, off)), "resolved_pattern")) {
     return g_ObjRevConfigIndexToSlc;
   }
 
@@ -7580,6 +7560,16 @@ static int WideScan_CollectCandidates(
 
 // Read SP game time.  Returns 0 if not yet discovered.
 static int ReadSPGameTime() {
+  // Stock August SP: 0x231081 reads this clock into renderCtx+0x238;
+  // CG_DrawHudElem passes it to 0x231E80, which subtracts it from elem+0x78.
+  // Prefer that exact native countdown clock over plausible-value guesses.
+  static const uintptr_t moduleBase = (uintptr_t)GetModuleHandleA(NULL);
+  int nativeTime = 0;
+  if (GameBuild::RuntimeReady() &&
+      ObjRev_ReadI32(moduleBase + IW6Offsets::ClientGameTime_SP, nativeTime) &&
+      nativeTime > 0 && nativeTime < 100000000) {
+    return nativeTime;
+  }
   if (!g_spGameTime.confirmed || g_spGameTime.addr == 0) {
     return 0;
   }
@@ -7671,7 +7661,7 @@ void TextHook_SuppressActiveCountdownLabel() {
   // should be close to (timeField - displayed_remaining_seconds * 1000).
   // We probe addresses and check if (timeField - candidate) is in a
   // plausible countdown range (0..300 seconds).
-  if (g_spGameTime.confirmed) {
+  if (ReadSPGameTime() > 0) {
     return;  // Already found
   }
   if (g_countdownTimeField <= 0) {
@@ -7687,19 +7677,19 @@ void TextHook_SuppressActiveCountdownLabel() {
       // playerState_s.commandTime at start of cg_s (MP cgArray)
       IW6Offsets::MPGlobals::cgArray,       // 0x176EC00
       // Some common SP offsets to try (near known SP structures)
-      0x176EC00 + 0x3388 + 0x3C7C,         // cg->snap->serverTime (if MP struct)
+      IW6Offsets::Profile::Rva_176EC00 + 0x3388 + 0x3C7C,         // cg->snap->serverTime (if MP struct)
       // Try offsets near HudElem array
-      0x147ED00,  0x147ED04,  0x147ED08,
+      IW6Offsets::Profile::Rva_147ED00,  IW6Offsets::Profile::Rva_147ED04,  IW6Offsets::Profile::Rva_147ED08,
       // Try some known IW6 SP patterns
-      0x1478000,  0x1478004,  0x1478008,
-      0x15B0000,  0x15B0004,  0x15B0008,
+      IW6Offsets::Profile::Rva_1478000,  IW6Offsets::Profile::Rva_1478004,  IW6Offsets::Profile::Rva_1478008,
+      IW6Offsets::Profile::Rva_15B0000,  IW6Offsets::Profile::Rva_15B0004,  IW6Offsets::Profile::Rva_15B0008,
       // Game time is often near level globals
-      0x3C91500,  0x3C91504,  0x3C91508,
-      0x3C914F8,  0x3C914FC,
+      IW6Offsets::Profile::Rva_3C91500,  IW6Offsets::Profile::Rva_3C91504,  IW6Offsets::Profile::Rva_3C91508,
+      IW6Offsets::Profile::Rva_3C914F8,  IW6Offsets::Profile::Rva_3C914FC,
       // cg_t area for SP (might be near MP cgArray but shifted)
-      0x1550000,  0x1550004,  0x1560000,
+      IW6Offsets::Profile::Rva_1550000,  IW6Offsets::Profile::Rva_1550004,  IW6Offsets::Profile::Rva_1560000,
       // Additional common engine time locations
-      0x43F4B60,  0x43F4B64,  0x43F4B68,  0x43F4B70,
+      IW6Offsets::Profile::Rva_43F4B60,  IW6Offsets::Profile::Rva_43F4B64,  IW6Offsets::Profile::Rva_43F4B68,  IW6Offsets::Profile::Rva_43F4B70,
   };
 
   static DWORD s_lastProbeLog = 0;
@@ -7762,12 +7752,12 @@ void TextHook_SuppressActiveCountdownLabel() {
       int n = 0;
       // Region 1: BEFORE entity array (level_locals_t lives here)
       n = WideScan_CollectCandidates(
-          s_moduleBase + 0x3C80000, entExclStart,
+          s_moduleBase + IW6Offsets::Profile::Rva_3C80000, entExclStart,
           g_countdownTimeField, g_wideScan.cands, 100000);
       // Region 2: AFTER entity array
       if (n < 100000) {
         n += WideScan_CollectCandidates(
-            entExclEnd, s_moduleBase + 0x3F00000,
+            entExclEnd, s_moduleBase + IW6Offsets::Profile::Rva_3F00000,
             g_countdownTimeField, g_wideScan.cands + n, 100000 - n);
       }
       // Region 3: near HudElem_Array_SP, excluding HudElem array itself
@@ -7775,14 +7765,14 @@ void TextHook_SuppressActiveCountdownLabel() {
         const uintptr_t hudExclStart = s_moduleBase + IW6Offsets::HudElem_Array_SP;
         const uintptr_t hudExclEnd   = hudExclStart + 2048 * IW6Offsets::HudElem_Array_Stride_SP;
         n += WideScan_CollectCandidates(
-            s_moduleBase + 0x1400000, s_moduleBase + 0x1580000,
+            s_moduleBase + IW6Offsets::Profile::Rva_1400000, s_moduleBase + IW6Offsets::Profile::Rva_1580000,
             g_countdownTimeField, g_wideScan.cands + n, 100000 - n,
             hudExclStart, hudExclEnd);
       }
       // Region 4: full module (excluding entity array)
       if (n < 100000) {
         n += WideScan_CollectCandidates(
-            s_moduleBase, s_moduleBase + 0x10000000,
+            s_moduleBase, s_moduleBase + IW6Offsets::Profile::SearchImageSpan,
             g_countdownTimeField, g_wideScan.cands + n, 100000 - n,
             entExclStart, entExclEnd);
       }
@@ -10981,7 +10971,6 @@ bool TextHook_GetCgDrawElemPtrCapture(uintptr_t elemPtr,
   out = it->second;
   return true;
 }
-
 
 
 

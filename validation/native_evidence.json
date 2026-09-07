@@ -1,0 +1,7 @@
+{
+  "native_clock": "0x178cca0",
+  "verified_runtime_signatures": 36,
+  "context_time_offset": "0x238",
+  "deadline_offset": "0x78",
+  "runtime_gameplay_validated": false
+}

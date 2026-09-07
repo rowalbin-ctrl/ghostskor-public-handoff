@@ -1,3 +1,4 @@
+#include "GameBuild.h"
 #undef WIN32_LEAN_AND_MEAN
 #include "D3D11Hook.h"
 #include "BinkHook.h"
@@ -6,6 +7,9 @@
 #include "GameViewport.h"
 #include "KoreanAtlas.h"
 #include "KoreanRenderer.h"
+#include "HudTextRenderer.h"
+#include "GameTweaks.h"
+#include "IW6Offsets.h"
 #include "NativeSubtitleTracker.h"
 #include "StateSaver.h"
 #include "TextHook.h"
@@ -102,7 +106,7 @@ static void UpdateScreenPlacement() {
   static uintptr_t s_moduleBase_sp = (uintptr_t)GetModuleHandleA(NULL);
   if (!s_ScrPlace_GetViewPlacement && s_moduleBase_sp) {
     s_ScrPlace_GetViewPlacement =
-        (ScrPlace_GetViewPlacement_t)(s_moduleBase_sp + 0x24D150);
+        (ScrPlace_GetViewPlacement_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(s_moduleBase_sp, IW6Offsets::ScrPlace_GetViewPlacement_SP)));
   }
   if (!s_ScrPlace_GetViewPlacement) {
     // Keep the last known-good placement if resolver is temporarily unavailable.
@@ -931,8 +935,11 @@ void PollRuntimeSignalDiagnostics(DWORD now) {
 } // namespace
 
 void D3D11Hook_ProcessSubtitles(IDXGISwapChain *pSwapChain) {
+  if (!GameBuild::RuntimeReady()) return;
   if (!pSwapChain)
     return;
+
+  GameTweaks::PollDynamicLights();
 
   // Ensure swap-chain descriptor is available for all rendering subsystems.
   // Hook_Present sets this when DXGIWrapper is NOT active; when the wrapper IS
@@ -1198,6 +1205,7 @@ void D3D11Hook_ProcessSubtitles(IDXGISwapChain *pSwapChain) {
 
   #include "D3D11Hook.Process.VideoSubtitles.inl"
   #include "D3D11Hook.Process.InGameSubtitles.inl"
+    const HudTextRenderer hudText(g_ActiveArea.height);
   #include "D3D11Hook.Process.IntroOverlay.inl"
   #include "D3D11Hook.Process.HudOverlayPrelude.inl"
   #include "D3D11Hook.Process.TimeScript.inl"
@@ -1205,7 +1213,6 @@ void D3D11Hook_ProcessSubtitles(IDXGISwapChain *pSwapChain) {
     #include "D3D11Hook.Process.DedicatedObjHudHint.inl"
   }
 }
-
 
 
 

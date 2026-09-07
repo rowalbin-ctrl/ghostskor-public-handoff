@@ -63,6 +63,10 @@ struct DrawCommand {
 
   // QTE overlay: use relaxed CalculateFinalScale clamps for this command.
   bool qteScaleMode;
+
+  // Screen-space multiplier applied AFTER the logical font size clamps.
+  // Kept separate so a valid 4K HUD size is not treated as a corrupt font.
+  float resolutionScale = 1.0f;
 };
 
 struct DrawStylePatch {
@@ -128,13 +132,15 @@ public:
   static void Cleanup(); // To release resources
 
   // Unified Scale Calculation Helper
-  static float CalculateFinalScale(float fontHeight, float cmdScale);
+  static float CalculateFinalScale(float fontHeight, float cmdScale,
+                                  float resolutionScale = 1.0f);
   // QTE overlay: temporarily raise CalculateFinalScale clamps.
   static void SetQteScaleMode(bool on);
 
   // Measure Text Width with unified scale
   static float MeasureTextWidthEx(const std::string &text, float fontHeight,
-                                  float scale, uint8_t atlasSlot = 0);
+                                  float scale, uint8_t atlasSlot = 0,
+                                  float resolutionScale = 1.0f);
 
   static void QueueText(const std::string &text, float x, float y, float scale,
                         const float *color, float fontHeight, int style,
@@ -146,7 +152,8 @@ public:
                         float maxWidthPx = 0.0f,
                         bool skipMenuClipping = false,
                         bool yIsTopOfText = false, uint8_t atlasSlot = 0,
-                        const DrawStylePatch *stylePatch = nullptr);
+                        const DrawStylePatch *stylePatch = nullptr,
+                        float resolutionScale = 1.0f);
 
   // Set glow on the most recently queued command (IW6 TextStyle.Shadowed)
   static void SetLastCommandGlow(float r, float g, float b, float a);

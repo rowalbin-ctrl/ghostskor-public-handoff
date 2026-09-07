@@ -1,3 +1,4 @@
+#include "GameBuild.h"
 #include "DXGIWrapper.h"
 #include "D3D11Hook.h"
 #include "GameViewport.h"
@@ -148,6 +149,7 @@ bool WrappedIDXGISwapChain::EnsureBackBufferRTV() {
 // Ensure Render Init happens once lazily
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain::Present(UINT SyncInterval,
                                                          UINT Flags) {
+  if (!GameBuild::RuntimeReady()) return m_pReal->Present(SyncInterval, Flags);
   if (!m_pDevice) {
     if (SUCCEEDED(
             m_pReal->GetDevice(__uuidof(ID3D11Device), (void **)&m_pDevice))) {

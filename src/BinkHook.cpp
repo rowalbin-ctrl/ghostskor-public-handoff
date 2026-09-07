@@ -54,15 +54,15 @@ static void ResolveDvarFunctions() {
     
     uintptr_t moduleBase = (uintptr_t)GetModuleHandleA(NULL);
     
-    g_Dvar_FindVar = (Dvar_FindVar_t)(moduleBase + IW6Offsets::Dvar_FindVar_SP);
+    g_Dvar_FindVar = (Dvar_FindVar_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(moduleBase, IW6Offsets::Dvar_FindVar_SP)));
     
     // Dvar_SetBool offset from symbols.hpp: SP=0x42C370
-    g_Dvar_SetBool = (Dvar_SetBool_t)(moduleBase + 0x42C370);
+    g_Dvar_SetBool = (Dvar_SetBool_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(moduleBase, IW6Offsets::Dvar_SetBool_SP)));
     
     // Dvar_GetBool offset from symbols.hpp: SP=0x429FC0
-    g_Dvar_GetBool = (Dvar_GetBool_t)(moduleBase + 0x429FC0);
+    g_Dvar_GetBool = (Dvar_GetBool_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(moduleBase, IW6Offsets::Dvar_GetBool_SP)));
     
-    g_DvarResolved = true;
+    g_DvarResolved = g_Dvar_FindVar && g_Dvar_SetBool && g_Dvar_GetBool;
     LogToFile("[BinkHook] Dvar functions resolved");
 }
 
@@ -98,7 +98,7 @@ static void DisableNativeSubtitles() {
     if (!Cbuf_AddText) {
         uintptr_t moduleBase = (uintptr_t)GetModuleHandleA(NULL);
         // Cbuf_AddText offset from symbols.hpp: SP=0x3B3050
-        Cbuf_AddText = (Cbuf_AddText_t)(moduleBase + 0x3B3050);
+        Cbuf_AddText = (Cbuf_AddText_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(moduleBase, IW6Offsets::Cbuf_AddText_SP)));
     }
     
     if (Cbuf_AddText) {
@@ -135,7 +135,7 @@ static void EnableNativeSubtitles() {
     
     if (!Cbuf_AddText) {
         uintptr_t moduleBase = (uintptr_t)GetModuleHandleA(NULL);
-        Cbuf_AddText = (Cbuf_AddText_t)(moduleBase + 0x3B3050);
+        Cbuf_AddText = (Cbuf_AddText_t)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(moduleBase, IW6Offsets::Cbuf_AddText_SP)));
     }
     
     if (Cbuf_AddText) {

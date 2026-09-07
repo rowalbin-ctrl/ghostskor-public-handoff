@@ -1,0 +1,71 @@
+{
+  "revision": "2026.09.08-R5",
+  "channel": "public-test",
+  "source_base_commit": "a32baaee2b1b535f95c40c68bb8c61baa221bb78",
+  "repository": "https://github.com/rowalbin-ctrl/ghostskor-public-handoff",
+  "supported_exe": {
+    "name": "iw6sp64_ship.exe",
+    "steam_build_id": 24723416,
+    "sha256": "e9f62f2b780d2dce8180f4b5fd9f0022e10c9f2596cc8066128c21169b74f110"
+  },
+  "release_zip": {
+    "name": "GhostsKor-SteamSP-2026.09.08-R5.zip",
+    "bytes": 7089724,
+    "sha256": "224891307ec1235aeb5467e448e1ecbf92385712640288f1a985a26e84bfbf29"
+  },
+  "payload": {
+    "dxgi.dll": {
+      "bytes": 7853056,
+      "sha256": "2154b16f851d9fc0469c37bc98217979bc3a3bb2d4588bcfd34382f7baa85475"
+    },
+    "localize.json": {
+      "bytes": 954689,
+      "sha256": "93b688ef16415bca326ced6b12795411e6e2b1eeb13c1a0849d320dafa64215a"
+    },
+    "localize_kr.json": {
+      "bytes": 963936,
+      "sha256": "32927ef3f5350ab2b0e90845ac02d0dc3338f5a3e74c9acaae1d8d221a6dbe8b"
+    },
+    "설치안내.txt": {
+      "bytes": 2955,
+      "sha256": "3c54b298e3fed141aa19051258d1e9320a45a209cca56a1ac2c8619c2b05d801"
+    },
+    "변경내역.txt": {
+      "bytes": 1703,
+      "sha256": "d4c89ef1dfe2ff869671d97e5e9862a10140f7964d60c77cc1d596e61599b556"
+    },
+    "SHA256SUMS.txt": {
+      "bytes": 404,
+      "sha256": "be93d48c357aaeab0174899146183cb39e8a53ad93e763b852254303e3a17746"
+    }
+  },
+  "build": {
+    "architecture": "x64",
+    "compiler": "MSVC 14.38",
+    "sdk": "10.0.19041",
+    "options": "/MT /O2 /EHa /std:c++17 /utf-8"
+  },
+  "validation": {
+    "build_passed": true,
+    "function_patterns": 31,
+    "runtime_code_checks": 36,
+    "matcher_publication_failure_tests_passed": true,
+    "hud_timer_and_lighting_policy_checks_passed": true,
+    "r2_user_observation": "Korean, countdown display and performance recovered in a loaded mission scene.",
+    "r5_live_game_validated": false,
+    "pending": [
+      "R5 game startup",
+      "lighting 0-to-4 command path and Ajax scene",
+      "4K visual size/wrapping",
+      "repeated-start menu alignment",
+      "full-campaign countdown behavior"
+    ]
+  },
+  "defender": {
+    "scan_date": "2026-09-08",
+    "definitions": "1.459.93.0",
+    "result": "No threats found in local scan of this exact DLL",
+    "digitally_signed": false
+  },
+  "future_exe_automatic_support": false
+}

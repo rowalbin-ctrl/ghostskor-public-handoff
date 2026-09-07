@@ -1,3 +1,14 @@
+# Current maintenance entry point
+
+The current revision is 2026.09.08 R5. Read README.md, MAINTENANCE_R5.md and
+VERSION_SUPPORT.md for current support/validation limits. The text below is
+the original handoff record. Its automatic deployment guidance is historical:
+always build with -NoDeploy and manually copy the DLL to the intended game folder.
+There is no export_public_handoff.ps1 in this repository; use git archive for
+tracked source exports. Do not package a recursive copy of the workspace.
+
+---
+
 # Maintainer Handoff
 
 This project is a source-based Korean patch for Call of Duty: Ghosts.

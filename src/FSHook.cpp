@@ -657,7 +657,7 @@ bool Initialize() {
   uintptr_t offset = isMP ? IW6Offsets::DB_FindXAssetHeader_MP
                           : IW6Offsets::DB_FindXAssetHeader_SP;
 
-  void *targetAddress = (void *)(moduleBase + offset);
+  void *targetAddress = IW6Offsets::GetAddress(moduleBase, offset);
   if (!targetAddress) {
     LogToFile("[FSHook] ERROR: DB_FindXAssetHeader target not found");
     return false;

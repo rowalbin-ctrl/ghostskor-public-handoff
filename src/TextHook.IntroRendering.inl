@@ -484,24 +484,9 @@ std::vector<NativeIntroRenderState> TextHook_GetAllNativeIntroStates() {
 // Discovered via disassembly: IntroRenderFn's coordinate transform uses
 // ADDSS XMM0, [RIP+offset] pointing to this address for both X and Y margins.
 EngineSafeArea TextHook_GetEngineSafeArea() {
-  EngineSafeArea sa = {0.0f, 0.0f};
-  uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
-  if (!base) return sa;
-
-  // base+0x706058: single float used as both X and Y safe area offset (pixels)
-  // base+0x70605C: check if there's a separate Y value (4 bytes after X)
-  volatile float *pSafeX = (volatile float *)(base + 0x706058);
-  volatile float *pSafeY = (volatile float *)(base + 0x70605C);
-
-  if (!IsBadReadPtr((void *)pSafeX, 8)) {
-    sa.x = *pSafeX;
-    sa.y = *pSafeY;
-    // If Y is zero or unreasonable, use same value as X (uniform margin)
-    if (sa.y < 0.1f || sa.y > 500.0f) {
-      sa.y = sa.x;
-    }
-  }
-  return sa;
+  // Historical values were constant 0.5 / 0.6 floats in .rdata, not mutable
+  // screen placement. Real safe-area values come from ScrPlace in D3D11Hook.
+  return EngineSafeArea{0.5f, 0.6f};
 }
 
 // POD snapshot for intro HudElem reads. Filled through SEH-safe helper so
@@ -773,7 +758,7 @@ static bool IsIntroTopLeftStatusLane(const IntroHudElemSnapshot &snap,
   if (snap.type != 1) {
     return false;
   }
-  if (callerOffset != 0x1F087Du) {
+  if (callerOffset != IW6Offsets::Profile::Rva_2316DB) {
     return false;
   }
   if (snap.horzAlign != 0 || snap.vertAlign != 0) {
@@ -804,8 +789,8 @@ static bool IsLikelyIntroCountdownFallbackLane(
                                     snap.vertAlign)) {
     return false;
   }
-  if (callerOffset == 0x1F087Du || callerOffset == 0x272ABBu ||
-      callerOffset == 0x1F1762u) {
+  if (callerOffset == IW6Offsets::Profile::Rva_2316DB || callerOffset == IW6Offsets::Profile::Rva_2B1453 ||
+      callerOffset == IW6Offsets::Profile::Rva_232562) {
     return true;
   }
   return (snap.horzAlign == 2 || snap.x >= 180.0f);
@@ -1883,7 +1868,7 @@ void Detour_IntroActualRender(int type, void *layoutResult, void *renderCtx,
                                    prefixOverlay.y, prefixOverlay.scale,
                                    prefixOverlay.fontHeight, 0,
                                    prefixOverlay.color,
-                                   prefixOverlay.yIsTopOfText, 0x416AE0u,
+                                   prefixOverlay.yIsTopOfText, IW6Offsets::IntroActualRender_SP,
                                    "IAR-PREFIX", prefixOverlay.forceAlign);
 
     static std::unordered_map<uint64_t, DWORD> s_prefixLogTick;
@@ -2737,7 +2722,7 @@ void Detour_IntroRenderFn(int type, int slcIndex, void *renderCtx, int count) {
                   osauthKey, rawForAuth, osauthCfg, (uint32_t)slcIndex,
                   snap.fxBirthTime, snap.fxLetterTime, osauthElemPtrOrIndex,
                   snap.x, snap.y, snap.fontScale, 78.0f, snap.colorPacked,
-                  640, 480, callerOffset, 0x1F1740u);
+                  640, 480, callerOffset, IW6Offsets::IntroRender_SP);
             } else if (kVerboseRuntimeLogs) {
               static std::unordered_map<std::string, unsigned long>
                   s_osauthIntroSkipLogTick;

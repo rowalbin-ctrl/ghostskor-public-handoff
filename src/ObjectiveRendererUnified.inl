@@ -738,8 +738,10 @@ void ObjUnified_Render(
     const float scale =
         (item.fontScale > 0.02f && item.fontScale < 10.0f)
             ? item.fontScale : 1.25f;
-    const float resMul = screenHeight / 1080.0f;
-    const float fontH = 78.0f * resMul;
+    // The renderer clamps logical font heights above 150. Keep the 1080p
+    // height intact and apply viewport scaling after those clamps.
+    const float resMul = g_ActiveArea.height / 1080.0f;
+    const float fontH = 78.0f;
 
     // Color from live HudElem (same for objective and status — Rule 2).
     const float alpha = Clamp01(item.alpha);
@@ -750,11 +752,11 @@ void ObjUnified_Render(
         alpha};
 
     const float width =
-        KoreanRenderer::MeasureTextWidthEx(displayText, fontH, scale);
+        KoreanRenderer::MeasureTextWidthEx(displayText, fontH, scale, 0, resMul);
     KoreanRenderer::QueueText(
         displayText, sx, sy, scale, color, fontH,
         0, width, false, false, 1.5f, false, false, true, 0,
-        screenWidth * 0.86f, true, true);
+        screenWidth * 0.86f, true, true, 0, nullptr, resMul);
 
     renderedKeys.insert(item.key);
 

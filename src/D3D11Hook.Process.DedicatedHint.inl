@@ -207,7 +207,7 @@
           } else if (he.nativeSource == (unsigned char)HUD_NATIVE_RENDER) {
             rank += 2;
           }
-          if (he.callerOffset == 0x1F087D) {
+          if (he.callerOffset == IW6Offsets::Profile::Rva_2316DB) {
             rank += 16;
           }
           if (std::isfinite(he.color[3]) && he.color[3] > 0.01f) {
@@ -319,11 +319,11 @@
           if (slot > 0 && slot < LUI_HINT_SLOT_ZOOM) {
             rank += 24;
           }
-          if (he.callerOffset == 0x1F087D) {
+          if (he.callerOffset == IW6Offsets::Profile::Rva_2316DB) {
             rank += 20;
-          } else if (he.callerOffset == 0x204816) {
+          } else if (he.callerOffset == IW6Offsets::Profile::Rva_2454FC) {
             rank += 14;
-          } else if (he.callerOffset == 0x1F1762) {
+          } else if (he.callerOffset == IW6Offsets::Profile::Rva_232562) {
             rank += 4;
           }
           if ((std::isfinite(he.nativeXScale) && he.nativeXScale >= 1.40f) ||
@@ -344,7 +344,7 @@
           if (looksLikeCenterPromptHintCached(he)) {
             rank += 12;
           }
-          if (he.callerOffset == 0x1F087D) {
+          if (he.callerOffset == IW6Offsets::Profile::Rva_2316DB) {
             rank += 10;
           }
           const float scaleMax =
@@ -392,18 +392,18 @@
               drawCompactTailSplit < displayText.size()) {
             const std::string pre = displayText.substr(0, drawCompactTailSplit);
             const std::string tail = displayText.substr(drawCompactTailSplit);
-            const float preW = KoreanRenderer::MeasureTextWidthEx(
+            const float preW = hudText.MeasureTextWidthEx(
                 pre, drawFontHeight, drawScale, drawAtlasSlot);
-            const float tailW = KoreanRenderer::MeasureTextWidthEx(
+            const float tailW = hudText.MeasureTextWidthEx(
                 tail, drawFontHeight, drawScale, drawAtlasSlot);
             if (!pre.empty()) {
-              KoreanRenderer::QueueText(
+              hudText.QueueText(
                   pre, drawX, drawY, drawScale, drawColor, drawFontHeight, 0,
                   preW, drawDisableShadow, false, 1.5f, false, false, false,
                   -1, 0.0f, false, true, drawAtlasSlot);
             }
             if (!tail.empty()) {
-              KoreanRenderer::QueueText(
+              hudText.QueueText(
                   tail, drawX + preW + drawCompactTailGap, drawY, drawScale,
                   drawColor, drawFontHeight, 0, tailW, drawDisableShadow, false,
                   1.5f, false, false, false, -1, 0.0f, false, true,
@@ -411,7 +411,7 @@
             }
           } else {
             const float renderWidth = (cachedFullWidth > 0.0f) ? cachedFullWidth :
-                KoreanRenderer::MeasureTextWidthEx(displayText, drawFontHeight,
+                hudText.MeasureTextWidthEx(displayText, drawFontHeight,
                                                    drawScale, drawAtlasSlot);
             size_t lb = displayText.find('[');
             size_t rb = (lb != std::string::npos)
@@ -423,32 +423,32 @@
               std::string keySeg = displayText.substr(lb, rb - lb + 1);
               std::string post = displayText.substr(rb + 1);
 
-              float preW = KoreanRenderer::MeasureTextWidthEx(
+              float preW = hudText.MeasureTextWidthEx(
                   pre, drawFontHeight, drawScale, drawAtlasSlot);
-              float keyW = KoreanRenderer::MeasureTextWidthEx(
+              float keyW = hudText.MeasureTextWidthEx(
                   keySeg, drawFontHeight, drawScale, drawAtlasSlot);
               float keyColor[4] = {1.0f, 0.85f, 0.2f, drawColor[3]};
 
               if (!pre.empty()) {
-                KoreanRenderer::QueueText(
+                hudText.QueueText(
                     pre, drawX, drawY, drawScale, drawColor, drawFontHeight, 0,
                     preW, drawDisableShadow, false, 1.5f, false, false, false,
                     -1, 0.0f, false, true, drawAtlasSlot);
               }
-              KoreanRenderer::QueueText(
+              hudText.QueueText(
                   keySeg, drawX + preW, drawY, drawScale, keyColor,
                   drawFontHeight, 0, keyW, drawDisableShadow, false, 1.5f,
                   false, false, false, -1, 0.0f, false, true, drawAtlasSlot);
               if (!post.empty()) {
-                float postW = KoreanRenderer::MeasureTextWidthEx(
+                float postW = hudText.MeasureTextWidthEx(
                     post, drawFontHeight, drawScale, drawAtlasSlot);
-                KoreanRenderer::QueueText(
+                hudText.QueueText(
                     post, drawX + preW + keyW, drawY, drawScale, drawColor,
                     drawFontHeight, 0, postW, drawDisableShadow, false, 1.5f,
                     false, false, false, -1, 0.0f, false, true, drawAtlasSlot);
               }
             } else {
-              KoreanRenderer::QueueText(
+              hudText.QueueText(
                   displayText, drawX, drawY, drawScale, drawColor, drawFontHeight,
                   0, renderWidth, drawDisableShadow, false, 1.5f, false, false,
                   false, -1, 0.0f, false, true, drawAtlasSlot);
@@ -895,7 +895,7 @@
           int bestDrillIdx = kv.second;
           for (int di = 0; di < (int)hintEntries.size(); ++di) {
             if (hintEntries[di].key == bk &&
-                hintEntries[di].callerOffset != 0x204816 &&
+                hintEntries[di].callerOffset != IW6Offsets::Profile::Rva_2454FC &&
                 hintEntries[di].callerOffset != 0) {
               bestDrillIdx = di;
               break;
@@ -1220,8 +1220,8 @@
           // CLOCKWORK_HINT_DRILL exempt (no CG_Draw rendering).
           {
             const bool isCgDrawRange =
-                (he.callerOffset >= 0x1F06B0 &&
-                 he.callerOffset <= 0x1F1B00);
+                (he.callerOffset >= IW6Offsets::CG_DrawHudElem_SP &&
+                 he.callerOffset <= IW6Offsets::Profile::Rva_1F1B00);
             const bool isDrillKey =
                 (key.rfind("CLOCKWORK_HINT_DRILL", 0) == 0);
             if (!isCgDrawRange && !isDrillKey &&
@@ -1630,8 +1630,8 @@
               // even for dormant HudElems, causing false-positive synth.
               if (!allowAuthorityOnlyPromptSynthesis) {
                 const bool isCgDrawCaller =
-                    (he.callerOffset >= 0x1F06B0 &&
-                     he.callerOffset <= 0x1F1B00);
+                    (he.callerOffset >= IW6Offsets::CG_DrawHudElem_SP &&
+                     he.callerOffset <= IW6Offsets::Profile::Rva_1F1B00);
                 if (cfgAlpha > 0.01f && !he.korean.empty() &&
                     isCgDrawCaller) {
                   allowAuthorityOnlyPromptSynthesis = true;
@@ -1670,8 +1670,8 @@
             // because it never receives CG_DrawHudElem rendering.
             {
               const bool isCgDrawRange =
-                  (he.callerOffset >= 0x1F06B0 &&
-                   he.callerOffset <= 0x1F1B00);
+                  (he.callerOffset >= IW6Offsets::CG_DrawHudElem_SP &&
+                   he.callerOffset <= IW6Offsets::Profile::Rva_1F1B00);
               const bool isDrillKey =
                   (key.rfind("CLOCKWORK_HINT_DRILL", 0) == 0);
               if (!isCgDrawRange && !isDrillKey) {
@@ -1839,7 +1839,7 @@
 
             std::string tailClean;
             {
-              const float baseW = KoreanRenderer::MeasureTextWidthEx(
+              const float baseW = hudText.MeasureTextWidthEx(
                   sc.baseResolved, fontHeight, scale, atlasSlot);
               const float tailQueryX = customPosIsCenterAnchor
                   ? (x - baseW * 0.5f)
@@ -2300,9 +2300,9 @@
               compactTailSplit < displayText.size()) {
             const std::string pre = displayText.substr(0, compactTailSplit);
             const std::string tail = displayText.substr(compactTailSplit);
-            const float preW = KoreanRenderer::MeasureTextWidthEx(
+            const float preW = hudText.MeasureTextWidthEx(
                 pre, fontHeight, scale, atlasSlot);
-            const float tailW = KoreanRenderer::MeasureTextWidthEx(
+            const float tailW = hudText.MeasureTextWidthEx(
                 tail, fontHeight, scale, atlasSlot);
             compactTailGap =
                 (std::min)(fontHeight * 0.16f,
@@ -2310,7 +2310,7 @@
             fullWidth = preW + compactTailGap + tailW;
           } else {
             fullWidth =
-                KoreanRenderer::MeasureTextWidthEx(displayText, fontHeight, scale,
+                hudText.MeasureTextWidthEx(displayText, fontHeight, scale,
                                                    atlasSlot);
           }
 
@@ -2604,12 +2604,12 @@
               const float fhBase = qo.baseFontHeight;
 
               // Layout uses base fh (stable) so companion never jitters.
-              const float bindWLayout = KoreanRenderer::MeasureTextWidthEx(
+              const float bindWLayout = hudText.MeasureTextWidthEx(
                   bindingText, fhBase, qo.baseScale, qo.atlasSlot);
-              const float compW = KoreanRenderer::MeasureTextWidthEx(
+              const float compW = hudText.MeasureTextWidthEx(
                   companionText, fhBase, qo.baseScale, qo.atlasSlot);
               const float scaleBase =
-                  KoreanRenderer::CalculateFinalScale(fhBase, qo.baseScale);
+                  hudText.CalculateFinalScale(fhBase, qo.baseScale);
 
               const float gap = fhBase * 0.15f;
               const float totalW = bindWLayout + gap + compW;
@@ -2617,10 +2617,10 @@
 
               // Actual binding width at animated fh (for centering within slot).
               KoreanRenderer::SetQteScaleMode(true);
-              const float bindWActual = KoreanRenderer::MeasureTextWidthEx(
+              const float bindWActual = hudText.MeasureTextWidthEx(
                   bindingText, fh, qo.baseScale, qo.atlasSlot);
               const float scaleAnim =
-                  KoreanRenderer::CalculateFinalScale(fh, qo.baseScale);
+                  hudText.CalculateFinalScale(fh, qo.baseScale);
               KoreanRenderer::SetQteScaleMode(false);
 
               // Binding renders centered within its layout slot.
@@ -2640,7 +2640,7 @@
               // Binding: gold color, animated fontHeight, pulsing alpha
               float goldColor[4] = {1.0f, 0.85f, 0.2f, bindAlpha};
               KoreanRenderer::SetQteScaleMode(true);
-              KoreanRenderer::QueueText(
+              hudText.QueueText(
                   bindingText, bindRenderX, bindY, qo.baseScale,
                   goldColor, fh, 0, bindWActual, qo.disableShadow,
                   false, 1.5f, false, false, false, -1, 0.0f, false,
@@ -2649,7 +2649,7 @@
 
               // Companion: white color, base fontHeight, fixed alpha
               float whiteColor[4] = {1.0f, 1.0f, 1.0f, compAlpha};
-              KoreanRenderer::QueueText(
+              hudText.QueueText(
                   companionText, compX, compY, qo.baseScale, whiteColor,
                   fhBase, 0, compW, qo.disableShadow, false, 1.5f,
                   false, false, false, -1, 0.0f, false, true,
@@ -2658,7 +2658,7 @@
               // === Single text (SKYWAY_HINT_RELOAD etc) ===
               float qteColor[4] = {1.0f, 1.0f, 1.0f, bindAlpha};
               KoreanRenderer::SetQteScaleMode(true);
-              const float w = KoreanRenderer::MeasureTextWidthEx(
+              const float w = hudText.MeasureTextWidthEx(
                   bindingText, fh, qo.baseScale, qo.atlasSlot);
               const float dx = qo.centerX - w / 2.0f;
               queueHintText(bindingText, dx, qo.centerY, qo.baseScale,

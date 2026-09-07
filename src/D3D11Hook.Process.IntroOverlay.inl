@@ -458,7 +458,7 @@
           // --- Render ---
           float lineScale = useFS * introScaleMul;
           uint8_t introAtlas = isCenterCard ? 1 : 0;
-          float textWidth = KoreanRenderer::MeasureTextWidthEx(
+          float textWidth = hudText.MeasureTextWidthEx(
               renderText, baseFontH, lineScale, introAtlas);
 
           // Title ghost pass (native multipass: dupe_hud / location_dupes_thread)
@@ -550,9 +550,9 @@
               if (altColor[3] > 0.34f) altColor[3] = 0.34f;
             }
 
-            float altWidth = KoreanRenderer::MeasureTextWidthEx(
+            float altWidth = hudText.MeasureTextWidthEx(
                 renderText, baseFontH, altScale, introAtlas);
-            KoreanRenderer::QueueText(renderText, altX, altY, altScale,
+            hudText.QueueText(renderText, altX, altY, altScale,
                                       altColor, baseFontH, 0, altWidth,
                                       true, false, 2.0f, false, false, false,
                                       -1, 0.0f, false, false, introAtlas);
@@ -573,9 +573,9 @@
               if (alt2Color[3] > 0.40f)  alt2Color[3] = 0.40f;
 
               if (alt2Color[3] > 0.002f) {
-                float alt2Width = KoreanRenderer::MeasureTextWidthEx(
+                float alt2Width = hudText.MeasureTextWidthEx(
                     renderText, baseFontH, alt2Scale, introAtlas);
-                KoreanRenderer::QueueText(renderText, alt2X, alt2Y, alt2Scale,
+                hudText.QueueText(renderText, alt2X, alt2Y, alt2Scale,
                                           alt2Color, baseFontH, 0, alt2Width,
                                           true, false, 2.0f, false, false, false,
                                           -1, 0.0f, false, false, introAtlas);
@@ -607,16 +607,16 @@
               if (glowA > 0.003f) {
                 float glowColor[4] = { glowR, glowG, glowB, glowA };
                 float glowOff = 1.5f * scaleF;
-                KoreanRenderer::QueueText(renderText, lineX - glowOff, lineY,
+                hudText.QueueText(renderText, lineX - glowOff, lineY,
                                           lineScale, glowColor, baseFontH, 0,
                                           textWidth, true, false, 2.0f);
-                KoreanRenderer::QueueText(renderText, lineX + glowOff, lineY,
+                hudText.QueueText(renderText, lineX + glowOff, lineY,
                                           lineScale, glowColor, baseFontH, 0,
                                           textWidth, true, false, 2.0f);
-                KoreanRenderer::QueueText(renderText, lineX, lineY - glowOff,
+                hudText.QueueText(renderText, lineX, lineY - glowOff,
                                           lineScale, glowColor, baseFontH, 0,
                                           textWidth, true, false, 2.0f);
-                KoreanRenderer::QueueText(renderText, lineX, lineY + glowOff,
+                hudText.QueueText(renderText, lineX, lineY + glowOff,
                                           lineScale, glowColor, baseFontH, 0,
                                           textWidth, true, false, 2.0f);
               }
@@ -625,10 +625,10 @@
               float glowAlpha = alpha * 0.05f;
               float glowColor[4] = { 0.425f, 0.465f, 0.46f, glowAlpha };
               float glowOff = 1.0f * scaleF;
-              KoreanRenderer::QueueText(renderText, lineX - glowOff, lineY,
+              hudText.QueueText(renderText, lineX - glowOff, lineY,
                                         lineScale, glowColor, baseFontH, 0,
                                         textWidth, true, false, 2.0f);
-              KoreanRenderer::QueueText(renderText, lineX + glowOff, lineY,
+              hudText.QueueText(renderText, lineX + glowOff, lineY,
                                         lineScale, glowColor, baseFontH, 0,
                                         textWidth, true, false, 2.0f);
             }
@@ -644,7 +644,7 @@
             float outA = alpha * 0.30f;
             float outColor[4] = { 0.0f, 0.06f, 0.06f, outA };
             float outOff = 1.5f * scaleF;
-            KoreanRenderer::QueueText(renderText, lineX + outOff, lineY + outOff,
+            hudText.QueueText(renderText, lineX + outOff, lineY + outOff,
                                       lineScale, outColor, baseFontH, 0,
                                       textWidth, true, false, 2.0f,
                                       false, false, false, -1,
@@ -673,7 +673,7 @@
               lineY += 8.0f * scaleF;
             }
           }
-          KoreanRenderer::QueueText(renderText, lineX, lineY, lineScale, color,
+          hudText.QueueText(renderText, lineX, lineY, lineScale, color,
                                     baseFontH, 0, mainWidthEng, isCenterCard, false,
                                     2.0f, false, false, false, mainAlign,
                                     0.0f, false, false, introAtlas);

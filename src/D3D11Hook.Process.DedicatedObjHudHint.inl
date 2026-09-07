@@ -509,7 +509,7 @@
             std::string tailClean;
             {
               const float tailQueryX = customPosIsCenterAnchor
-                  ? (x - KoreanRenderer::MeasureTextWidthEx(
+                  ? (x - hudText.MeasureTextWidthEx(
                              sc.baseResolved, fontHeight, scale) *
                          0.5f)
                   : x;
@@ -696,15 +696,15 @@
           if (hasCompactTail) {
             ctPre = displayText.substr(0, compactTailSplit);
             ctTail = displayText.substr(compactTailSplit);
-            ctPreW = KoreanRenderer::MeasureTextWidthEx(ctPre, fontHeight, scale);
-            ctTailW = KoreanRenderer::MeasureTextWidthEx(ctTail, fontHeight, scale);
+            ctPreW = hudText.MeasureTextWidthEx(ctPre, fontHeight, scale);
+            ctTailW = hudText.MeasureTextWidthEx(ctTail, fontHeight, scale);
             compactTailGap =
                 (std::min)(fontHeight * 0.16f,
                            (std::max)(1.5f * scaleY, fontHeight * 0.035f));
             fullWidth = ctPreW + compactTailGap + ctTailW;
           } else {
             fullWidth =
-                KoreanRenderer::MeasureTextWidthEx(displayText, fontHeight, scale);
+                hudText.MeasureTextWidthEx(displayText, fontHeight, scale);
           }
 
           if (customPosIsCenterAnchor)
@@ -713,11 +713,11 @@
           // === Render with key binding coloring ===============================
           if (hasCompactTail) {
             if (!ctPre.empty())
-              KoreanRenderer::QueueText(ctPre, x, y, scale, color,
+              hudText.QueueText(ctPre, x, y, scale, color,
                                         fontHeight, 0, ctPreW, false, false, 1.5f,
                                         false, false, false, 0);
             if (!ctTail.empty())
-              KoreanRenderer::QueueText(ctTail, x + ctPreW + compactTailGap, y,
+              hudText.QueueText(ctTail, x + ctPreW + compactTailGap, y,
                                         scale, color, fontHeight, 0, ctTailW,
                                         false, false, 1.5f,
                                         false, false, false, 0);
@@ -730,24 +730,24 @@
               std::string pre = displayText.substr(0, lb);
               std::string keySeg = displayText.substr(lb, rb - lb + 1);
               std::string post = displayText.substr(rb + 1);
-              float preW = KoreanRenderer::MeasureTextWidthEx(pre, fontHeight, scale);
-              float keyW = KoreanRenderer::MeasureTextWidthEx(keySeg, fontHeight, scale);
+              float preW = hudText.MeasureTextWidthEx(pre, fontHeight, scale);
+              float keyW = hudText.MeasureTextWidthEx(keySeg, fontHeight, scale);
               float keyColor[4] = {1.0f, 0.85f, 0.2f, color[3]};
               if (!pre.empty())
-                KoreanRenderer::QueueText(pre, x, y, scale, color,
+                hudText.QueueText(pre, x, y, scale, color,
                                           fontHeight, 0, preW, false, false, 1.5f,
                                           false, false, false, 0);
-              KoreanRenderer::QueueText(keySeg, x + preW, y, scale,
+              hudText.QueueText(keySeg, x + preW, y, scale,
                                         keyColor, fontHeight, 0, keyW, false, false, 1.5f,
                                         false, false, false, 0);
               if (!post.empty()) {
-                float postW = KoreanRenderer::MeasureTextWidthEx(post, fontHeight, scale);
-                KoreanRenderer::QueueText(post, x + preW + keyW, y, scale,
+                float postW = hudText.MeasureTextWidthEx(post, fontHeight, scale);
+                hudText.QueueText(post, x + preW + keyW, y, scale,
                                           color, fontHeight, 0, postW, false, false, 1.5f,
                                           false, false, false, 0);
               }
             } else {
-              KoreanRenderer::QueueText(displayText, x, y, scale, color,
+              hudText.QueueText(displayText, x, y, scale, color,
                                         fontHeight, 0, fullWidth, false, false, 1.5f,
                                         false, false, false, 0);
             }

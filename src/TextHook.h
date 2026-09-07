@@ -1131,8 +1131,10 @@ bool TextHook_TimeScriptOnIntroActualRenderCandidate(
     const char *key, const char *rawText, const char *sourceTag,
     uintptr_t stringAddr, uintptr_t rootBase, int score, int slcIdx);
 bool TextHook_GetTimeScriptRenderSnapshot(TimeScriptRenderSnapshot &outState);
+bool TextHook_HasTimeScriptTimerReplacement();
 void TextHook_SuppressActiveCountdownLabel();
-void TextHook_TimeScriptCaptureRenderedTimer(const std::string &timerTail);
+void TextHook_TimeScriptCaptureRenderedTimer(const std::string &timerTail,
+                                           const std::string &expectedKey);
 void TextHook_TimeScriptDiscoverFallbackTimer();
 int  TextHook_ReadSPGameTime();  // Returns current SP game time in ms, 0 if unknown
 int  TextHook_GetCountdownTimeField();  // Returns HudElem time field (absolute end ms)

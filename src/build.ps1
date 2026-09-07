@@ -1,5 +1,6 @@
 param(
-  [switch]$NoDeploy
+  [switch]$NoDeploy,
+  [string]$ToolchainSetup
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,24 +49,30 @@ $verifyScript = Join-Path $projectDir "verify_encoding.ps1"
 if (Test-Path $verifyScript) {
   & $verifyScript -ProjectRoot $projectDir
 }
+& (Join-Path $projectDir "verify_addresses.ps1") -ProjectRoot $projectDir
 
 Write-Host "[GhostsKor] Starting Build Process..."
 
-$vswherePath = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-if (-not (Test-Path $vswherePath)) {
-  throw "Visual Studio Installer\vswhere.exe not found."
-}
-
-$vsPath = & $vswherePath -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
-if (-not $vsPath) {
-  throw "Visual Studio with C++ workload not found."
-}
-
-Write-Host "[GhostsKor] Found VS at: $vsPath"
-
-$vcvarsPath = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
-if (-not (Test-Path $vcvarsPath)) {
-  throw "vcvars64.bat not found."
+if ($ToolchainSetup) {
+  $vcvarsPath = (Resolve-Path -LiteralPath $ToolchainSetup -ErrorAction Stop).Path
+  if ([System.IO.Path]::GetExtension($vcvarsPath) -notin @('.bat', '.cmd')) {
+    throw "ToolchainSetup must be an existing .bat or .cmd environment setup file."
+  }
+  Write-Host "[GhostsKor] Using toolchain setup: $vcvarsPath"
+} else {
+  $vswherePath = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+  if (-not (Test-Path $vswherePath)) {
+    throw "Visual Studio Installer\vswhere.exe not found. Use -ToolchainSetup for a standalone MSVC environment."
+  }
+  $vsPath = & $vswherePath -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+  if (-not $vsPath) {
+    throw "Visual Studio with C++ workload not found."
+  }
+  Write-Host "[GhostsKor] Found VS at: $vsPath"
+  $vcvarsPath = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+  if (-not (Test-Path $vcvarsPath)) {
+    throw "vcvars64.bat not found."
+  }
 }
 
 $sources = @(
@@ -75,6 +82,9 @@ $sources = @(
   "texthook.cpp",
   "detour.cpp",
   "dllmain.cpp",
+  "GameBuild.cpp",
+  "GameAddresses.cpp",
+  "GameTweaks.cpp",
   "DXGIWrapper.cpp",
   "D3D11Hook.cpp",
   "BindingResolver.cpp",

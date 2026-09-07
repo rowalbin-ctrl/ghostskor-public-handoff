@@ -365,8 +365,8 @@ bool TextHook_TimeScriptOnIntroActualRenderCandidate(
         if (gameTime <= 0) {
           static const uintptr_t s_modBase = (uintptr_t)GetModuleHandleA(NULL);
           const uintptr_t kGTOffsets[] = {
-              0x1473528, 0x147352C, 0x1473520, 0x1473524,
-              0x147ED00, 0x147ED04, 0x147ED08,
+              IW6Offsets::Profile::Rva_1473528, IW6Offsets::Profile::Rva_147352C, IW6Offsets::Profile::Rva_1473520, IW6Offsets::Profile::Rva_1473524,
+              IW6Offsets::Profile::Rva_147ED00, IW6Offsets::Profile::Rva_147ED04, IW6Offsets::Profile::Rva_147ED08,
           };
           for (size_t ci = 0;
                ci < sizeof(kGTOffsets) / sizeof(kGTOffsets[0]); ++ci) {
@@ -385,8 +385,8 @@ bool TextHook_TimeScriptOnIntroActualRenderCandidate(
           }
         }
       }
-      if (gameTime > 0 && effTime > 0 && effTime > gameTime) {
-        const float proposedSeconds = (float)(effTime - gameTime) / 1000.0f;
+      if (gameTime > 0 && effTime > 0) {
+        const float proposedSeconds = (float)(std::max)(0, effTime - gameTime) / 1000.0f;
         if (!TimeScript_ShouldInvalidateExpiryJumpLocked(
                 g_TimeScriptRuntimeState.renderSnapshot.key, proposedSeconds,
                 "ttl")) {
@@ -612,13 +612,13 @@ iar_direct_rescan:
               }
               if (gameTime <= 0) {
                 const uintptr_t kGTOffsets[] = {
-                    0x1473528, 0x147352C, 0x1473520, 0x1473524,
-                    0x147ED00, 0x147ED04, 0x147ED08,
-                    0x1478000, 0x1478004, 0x1478008,
-                    0x15B0000, 0x15B0004, 0x15B0008,
-                    0x3C91500, 0x3C91504, 0x3C91508, 0x3C914F8, 0x3C914FC,
-                    0x1550000, 0x1550004, 0x1560000,
-                    0x43F4B60, 0x43F4B64, 0x43F4B68, 0x43F4B70,
+                    IW6Offsets::Profile::Rva_1473528, IW6Offsets::Profile::Rva_147352C, IW6Offsets::Profile::Rva_1473520, IW6Offsets::Profile::Rva_1473524,
+                    IW6Offsets::Profile::Rva_147ED00, IW6Offsets::Profile::Rva_147ED04, IW6Offsets::Profile::Rva_147ED08,
+                    IW6Offsets::Profile::Rva_1478000, IW6Offsets::Profile::Rva_1478004, IW6Offsets::Profile::Rva_1478008,
+                    IW6Offsets::Profile::Rva_15B0000, IW6Offsets::Profile::Rva_15B0004, IW6Offsets::Profile::Rva_15B0008,
+                    IW6Offsets::Profile::Rva_3C91500, IW6Offsets::Profile::Rva_3C91504, IW6Offsets::Profile::Rva_3C91508, IW6Offsets::Profile::Rva_3C914F8, IW6Offsets::Profile::Rva_3C914FC,
+                    IW6Offsets::Profile::Rva_1550000, IW6Offsets::Profile::Rva_1550004, IW6Offsets::Profile::Rva_1560000,
+                    IW6Offsets::Profile::Rva_43F4B60, IW6Offsets::Profile::Rva_43F4B64, IW6Offsets::Profile::Rva_43F4B68, IW6Offsets::Profile::Rva_43F4B70,
                 };
                 for (size_t ci = 0;
                      ci < sizeof(kGTOffsets) / sizeof(kGTOffsets[0]); ++ci) {
@@ -645,10 +645,9 @@ iar_direct_rescan:
               }
             }
 
-            if (gameTime > 0 && effectiveTimeField > 0 &&
-                effectiveTimeField > gameTime) {
+            if (gameTime > 0 && effectiveTimeField > 0) {
               renderSnap.timerSeconds =
-                  (float)(effectiveTimeField - gameTime) / 1000.0f;
+                  (float)(std::max)(0, effectiveTimeField - gameTime) / 1000.0f;
               renderSnap.timerComputed = true;
             }
           }
@@ -838,6 +837,24 @@ bool TextHook_GetTimeScriptRenderSnapshot(TimeScriptRenderSnapshot &outState) {
   return true;
 }
 
+bool TextHook_HasTimeScriptTimerReplacement() {
+  // Called for native HUD draws: avoid allocating/copying the text snapshot.
+  std::lock_guard<std::mutex> lock(g_TimeScriptRuntimeState.mutex);
+  const auto &snap = g_TimeScriptRuntimeState.renderSnapshot;
+  const DWORD now = GetTickCount();
+  const bool ownerLive =
+      (g_TimeScriptRuntimeState.directOwnerTick != 0 &&
+       now - g_TimeScriptRuntimeState.directOwnerTick <= kTimeScriptSnapshotTtlMs) ||
+      (g_TimeScriptRuntimeState.iarFallbackOwnerTick != 0 &&
+       now - g_TimeScriptRuntimeState.iarFallbackOwnerTick <= kTimeScriptSnapshotTtlMs);
+  return ownerLive && snap.active && !snap.renderText.empty() &&
+         snap.lastSeenTick != 0 && now - snap.lastSeenTick <= kTimeScriptSnapshotTtlMs &&
+         snap.timerComputed && std::isfinite(snap.timerSeconds) &&
+         snap.timerSeconds > 0.05f && std::isfinite(snap.x) &&
+         std::isfinite(snap.y) && std::isfinite(snap.scale) &&
+         std::isfinite(snap.fontHeight) && snap.color[3] > 0.01f;
+}
+
 // Scan HudElem array for a countdown timer (time > 30000) when the FALLBACK
 // snapshot is active but timerComputed == false.  Updates the snapshot's
 // timerSeconds and caches the time field for companion suppress.
@@ -862,13 +879,13 @@ void TextHook_TimeScriptDiscoverFallbackTimer() {
         if (gameTime <= 0) {
           static uintptr_t s_modBase = (uintptr_t)GetModuleHandleA(NULL);
           static const uintptr_t kGTOffsets[] = {
-              0x1473528, 0x147352C, 0x1473520, 0x1473524,
-              0x147ED00, 0x147ED04, 0x147ED08,
-              0x1478000, 0x1478004, 0x1478008,
-              0x15B0000, 0x15B0004, 0x15B0008,
-              0x3C91500, 0x3C91504, 0x3C91508, 0x3C914F8, 0x3C914FC,
-              0x1550000, 0x1550004, 0x1560000,
-              0x43F4B60, 0x43F4B64, 0x43F4B68, 0x43F4B70,
+              IW6Offsets::Profile::Rva_1473528, IW6Offsets::Profile::Rva_147352C, IW6Offsets::Profile::Rva_1473520, IW6Offsets::Profile::Rva_1473524,
+              IW6Offsets::Profile::Rva_147ED00, IW6Offsets::Profile::Rva_147ED04, IW6Offsets::Profile::Rva_147ED08,
+              IW6Offsets::Profile::Rva_1478000, IW6Offsets::Profile::Rva_1478004, IW6Offsets::Profile::Rva_1478008,
+              IW6Offsets::Profile::Rva_15B0000, IW6Offsets::Profile::Rva_15B0004, IW6Offsets::Profile::Rva_15B0008,
+              IW6Offsets::Profile::Rva_3C91500, IW6Offsets::Profile::Rva_3C91504, IW6Offsets::Profile::Rva_3C91508, IW6Offsets::Profile::Rva_3C914F8, IW6Offsets::Profile::Rva_3C914FC,
+              IW6Offsets::Profile::Rva_1550000, IW6Offsets::Profile::Rva_1550004, IW6Offsets::Profile::Rva_1560000,
+              IW6Offsets::Profile::Rva_43F4B60, IW6Offsets::Profile::Rva_43F4B64, IW6Offsets::Profile::Rva_43F4B68, IW6Offsets::Profile::Rva_43F4B70,
           };
           for (size_t ci = 0; ci < sizeof(kGTOffsets)/sizeof(kGTOffsets[0]); ++ci) {
             uintptr_t addr = s_modBase + kGTOffsets[ci];
@@ -913,13 +930,13 @@ void TextHook_TimeScriptDiscoverFallbackTimer() {
   int gameTime = TextHook_ReadSPGameTime();
   if (gameTime <= 0) {
     static const uintptr_t kGTOffsets[] = {
-        0x1473528, 0x147352C, 0x1473520, 0x1473524,
-        0x147ED00, 0x147ED04, 0x147ED08,
-        0x1478000, 0x1478004, 0x1478008,
-        0x15B0000, 0x15B0004, 0x15B0008,
-        0x3C91500, 0x3C91504, 0x3C91508, 0x3C914F8, 0x3C914FC,
-        0x1550000, 0x1550004, 0x1560000,
-        0x43F4B60, 0x43F4B64, 0x43F4B68, 0x43F4B70,
+        IW6Offsets::Profile::Rva_1473528, IW6Offsets::Profile::Rva_147352C, IW6Offsets::Profile::Rva_1473520, IW6Offsets::Profile::Rva_1473524,
+        IW6Offsets::Profile::Rva_147ED00, IW6Offsets::Profile::Rva_147ED04, IW6Offsets::Profile::Rva_147ED08,
+        IW6Offsets::Profile::Rva_1478000, IW6Offsets::Profile::Rva_1478004, IW6Offsets::Profile::Rva_1478008,
+        IW6Offsets::Profile::Rva_15B0000, IW6Offsets::Profile::Rva_15B0004, IW6Offsets::Profile::Rva_15B0008,
+        IW6Offsets::Profile::Rva_3C91500, IW6Offsets::Profile::Rva_3C91504, IW6Offsets::Profile::Rva_3C91508, IW6Offsets::Profile::Rva_3C914F8, IW6Offsets::Profile::Rva_3C914FC,
+        IW6Offsets::Profile::Rva_1550000, IW6Offsets::Profile::Rva_1550004, IW6Offsets::Profile::Rva_1560000,
+        IW6Offsets::Profile::Rva_43F4B60, IW6Offsets::Profile::Rva_43F4B64, IW6Offsets::Profile::Rva_43F4B68, IW6Offsets::Profile::Rva_43F4B70,
     };
     for (size_t ci = 0; ci < sizeof(kGTOffsets) / sizeof(kGTOffsets[0]); ++ci) {
       uintptr_t addr = s_modBase + kGTOffsets[ci];
@@ -949,7 +966,8 @@ void TextHook_TimeScriptDiscoverFallbackTimer() {
 // is rendered inside a CG_DrawHudElem with active persist suppress.
 // Parses the timer text and updates the FALLBACK snapshot's timerSeconds
 // so the D3D11 overlay can display the correct countdown.
-void TextHook_TimeScriptCaptureRenderedTimer(const std::string &timerTail) {
+void TextHook_TimeScriptCaptureRenderedTimer(const std::string &timerTail,
+                                           const std::string &expectedKey) {
   // Parse "M:SS" or "M:SS.T" format
   int mins = 0, secs = 0, tenths = 0;
   bool hasTenths = false;
@@ -977,9 +995,9 @@ void TextHook_TimeScriptCaptureRenderedTimer(const std::string &timerTail) {
 
   std::lock_guard<std::mutex> lock(g_TimeScriptRuntimeState.mutex);
   TimeScriptRenderSnapshot &snap = g_TimeScriptRuntimeState.renderSnapshot;
-  if (!snap.active || snap.key.empty()) return;
-  // Only update when timerComputed is false (FALLBACK path)
-  if (snap.timerComputed) return;
+  if (!snap.active || snap.key != expectedKey || expectedKey.empty()) return;
+  // Every native draw is authoritative, including when an earlier frame
+  // already populated the snapshot. A one-shot capture freezes the number.
   snap.timerSeconds = totalSeconds;
   snap.timerComputed = true;
   snap.lastSeenTick = GetTickCount();
@@ -1401,15 +1419,15 @@ static void TimeScript_StoreSnapshotFromHudElemTimer(
         const uintptr_t kGTOffsets[] = {
             IW6Offsets::MPGlobals::serverTime,   // 0x647B280
             IW6Offsets::MPGlobals::cgArray,      // 0x176EC00
-            0x176EC00 + 0x3388 + 0x3C7C,
+            IW6Offsets::Profile::Rva_176EC00 + 0x3388 + 0x3C7C,
             // Confirmed SP game time offset (from wide-scan discovery)
-            0x1473528, 0x147352C, 0x1473520, 0x1473524,
-            0x147ED00, 0x147ED04, 0x147ED08,
-            0x1478000, 0x1478004, 0x1478008,
-            0x15B0000, 0x15B0004, 0x15B0008,
-            0x3C91500, 0x3C91504, 0x3C91508, 0x3C914F8, 0x3C914FC,
-            0x1550000, 0x1550004, 0x1560000,
-            0x43F4B60, 0x43F4B64, 0x43F4B68, 0x43F4B70,
+            IW6Offsets::Profile::Rva_1473528, IW6Offsets::Profile::Rva_147352C, IW6Offsets::Profile::Rva_1473520, IW6Offsets::Profile::Rva_1473524,
+            IW6Offsets::Profile::Rva_147ED00, IW6Offsets::Profile::Rva_147ED04, IW6Offsets::Profile::Rva_147ED08,
+            IW6Offsets::Profile::Rva_1478000, IW6Offsets::Profile::Rva_1478004, IW6Offsets::Profile::Rva_1478008,
+            IW6Offsets::Profile::Rva_15B0000, IW6Offsets::Profile::Rva_15B0004, IW6Offsets::Profile::Rva_15B0008,
+            IW6Offsets::Profile::Rva_3C91500, IW6Offsets::Profile::Rva_3C91504, IW6Offsets::Profile::Rva_3C91508, IW6Offsets::Profile::Rva_3C914F8, IW6Offsets::Profile::Rva_3C914FC,
+            IW6Offsets::Profile::Rva_1550000, IW6Offsets::Profile::Rva_1550004, IW6Offsets::Profile::Rva_1560000,
+            IW6Offsets::Profile::Rva_43F4B60, IW6Offsets::Profile::Rva_43F4B64, IW6Offsets::Profile::Rva_43F4B68, IW6Offsets::Profile::Rva_43F4B70,
         };
         for (size_t ci = 0;
              ci < sizeof(kGTOffsets) / sizeof(kGTOffsets[0]); ++ci) {
@@ -1438,15 +1456,16 @@ static void TimeScript_StoreSnapshotFromHudElemTimer(
       }
     }
 
-    if (gameTime > 0 && effectiveTimeField > 0 && effectiveTimeField > gameTime) {
+    if (gameTime > 0 && effectiveTimeField > 0) {
       const float proposedSeconds =
-          (float)(effectiveTimeField - gameTime) / 1000.0f;
+          (float)(std::max)(0, effectiveTimeField - gameTime) / 1000.0f;
       if (TimeScript_ShouldInvalidateExpiryJumpLocked(renderSnap.key,
                                                       proposedSeconds,
                                                       "scanner")) {
         return;
       }
       renderSnap.timerSeconds = proposedSeconds;
+      renderSnap.timerComputed = true;
     } else if (valueField > 0.01f && valueField < 600.0f) {
       renderSnap.timerSeconds = valueField;  // fallback
     }
@@ -1628,7 +1647,7 @@ static void TimeScript_PostDrawHook() {
   TimeScript_UpdateAuthoritativeRenderSnapshot(ctx);
 }
 
-static constexpr uintptr_t kTimeScriptFixedBufferAddr = 0x049B00A8ull;
+static constexpr uintptr_t kTimeScriptFixedBufferAddr = IW6Offsets::Profile::Rva_49B00A8;
 
 static bool TimeScript_TryResolveFallbackScanRange(
     TimeScriptFallbackScanRange &outRange);
