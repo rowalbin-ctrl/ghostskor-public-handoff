@@ -6,9 +6,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <stdexcept>
 
 
-// Stub implementation of nlohmann::json for compilation without full library
+// Minimal flat localization-map reader (strings or null), not the full library.
 namespace nlohmann {
 struct json {
   std::map<std::string, std::string> data;
@@ -99,6 +100,10 @@ struct json {
           result += '\t';
           ++i;
           continue;
+        } else if (next == 'b' || next == 'f') {
+          result += next == 'b' ? '\b' : '\f';
+          ++i;
+          continue;
         } else if (next == 'u') {
           uint32_t cp = 0;
           if (parseHex4(i + 2, cp)) {
@@ -125,44 +130,79 @@ struct json {
     return result;
   }
 
-  // Very basic parser for flat string-string JSON
+  // Parse delimiters as well as strings. Searching for the next quote after
+  // a null value accidentally consumes the NEXT KEY as this entry's value.
   friend std::istream &operator>>(std::istream &is, json &j) {
     std::string content((std::istreambuf_iterator<char>(is)),
                         (std::istreambuf_iterator<char>()));
-    // Simple manual parse for keys/values
-    // "KEY": "VALUE"
-    size_t pos = 0;
-    while (true) {
-      size_t quote1 = findUnescapedQuote(content, pos);
-      if (quote1 == std::string::npos)
-        break;
-      size_t quote2 = findUnescapedQuote(content, quote1 + 1);
-      if (quote2 == std::string::npos)
-        break;
-      std::string key = content.substr(quote1 + 1, quote2 - quote1 - 1);
-
-      size_t colon = content.find(':', quote2);
-      if (colon == std::string::npos)
-        break;
-
-      size_t quote3 = findUnescapedQuote(content, colon);
-      if (quote3 == std::string::npos)
-        break;
-      size_t quote4 = findUnescapedQuote(content, quote3 + 1);
-      if (quote4 == std::string::npos)
-        break;
-      std::string value = content.substr(quote3 + 1, quote4 - quote3 - 1);
-
-      // Unescape the value
-      j.data[key] = unescape(value);
-      pos = quote4 + 1;
+    size_t pos = content.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
+    auto fail = [] { throw std::runtime_error("Invalid flat localization JSON"); };
+    auto whitespace = [&] {
+      while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\t' ||
+             content[pos] == '\r' || content[pos] == '\n')) ++pos;
+    };
+    auto consume = [&](char c) {
+      whitespace();
+      if (pos >= content.size() || content[pos] != c) fail();
+      ++pos;
+    };
+    auto hex4 = [&](size_t at) -> unsigned {
+      if (at > content.size() || content.size() - at < 4) fail();
+      unsigned value = 0;
+      for (size_t i = 0; i < 4; ++i) {
+        const char c = content[at + i];
+        const int digit = c >= '0' && c <= '9' ? c - '0' :
+                          c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                          c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (digit < 0) fail();
+        value = value * 16 + digit;
+      }
+      return value;
+    };
+    auto readString = [&]() -> std::string {
+      consume('"');
+      const size_t start = pos;
+      while (pos < content.size()) {
+        const unsigned char c = content[pos++];
+        if (c == '"') return unescape(content.substr(start, pos - start - 1));
+        if (c < 0x20) fail();
+        if (c != '\\') continue;
+        if (pos >= content.size()) fail();
+        const char escape = content[pos++];
+        if (escape == 'u') {
+          const unsigned value = hex4(pos); pos += 4;
+          if (value >= 0xD800 && value <= 0xDBFF) {
+            if (content.compare(pos, 2, "\\u") != 0) fail();
+            const unsigned low = hex4(pos + 2);
+            if (low < 0xDC00 || low > 0xDFFF) fail();
+            pos += 6;
+          } else if (value >= 0xDC00 && value <= 0xDFFF) fail();
+        } else if (std::string("\"\\/bfnrt").find(escape) == std::string::npos) fail();
+      }
+      fail(); return {};
+    };
+    std::map<std::string, std::string> parsed;
+    consume('{'); whitespace();
+    if (pos < content.size() && content[pos] != '}') {
+      while (true) {
+        const auto key = readString(); consume(':'); whitespace();
+        if (pos < content.size() && content[pos] == '"') parsed[key] = readString();
+        else if (content.compare(pos, 4, "null") == 0) { pos += 4; parsed.erase(key); }
+        else fail();
+        whitespace();
+        if (pos < content.size() && content[pos] == '}') break;
+        consume(',');
+      }
     }
+    consume('}'); whitespace();
+    if (pos != content.size()) fail();
+    j.data = std::move(parsed); // publish only a complete, valid map
     return is;
   }
 
   // Iterator support
-  auto items() {
-    return data; // Return copy of map for range-based loop (simplified)
+  const auto& items() const {
+    return data;
   }
 };
 } // namespace nlohmann

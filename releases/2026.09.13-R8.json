@@ -1,0 +1,43 @@
+{
+  "revision": "2026.09.13-R8",
+  "github_publication_date": "2026-09-30",
+  "supported_steam_sp_build": 24723416,
+  "supported_exe_sha256": "e9f62f2b780d2dce8180f4b5fd9f0022e10c9f2596cc8066128c21169b74f110",
+  "distribution": {
+    "name": "GhostsKor-SteamSP-2026.09.13-R8.zip",
+    "sha256": "ce7f85be4b0f0636802bbfe4206ec93c21d6108d2c83c5f4e100726311ea7e37",
+    "bytes": 6821946
+  },
+  "payload": {
+    "dxgi.dll": {
+      "bytes": 7309312,
+      "sha256": "ca9e20318d6e72b7ebe78b2688357455c99fd5ccfe6682a89618d0ae34e5c4c1"
+    },
+    "localize.json": {
+      "bytes": 954689,
+      "sha256": "93b688ef16415bca326ced6b12795411e6e2b1eeb13c1a0849d320dafa64215a"
+    },
+    "localize_kr.json": {
+      "bytes": 970079,
+      "sha256": "b52d4c282d6fcf91d3f0bd8aa5128757d4faddf12f3c32f6b0561ea1b66da291"
+    }
+  },
+  "source_snapshot_checks": {
+    "SubtitleViewport.h": "c4ef4cfc8b9a9ef5767c4e3c2cf1175b0c01c0ae73f41dd4a1bc98bf5e2b885e",
+    "D3D11Hook.SubtitleViewport.inl": "e195613137a310a01244a5b345f073f2ad2b20ddb9ac64bf5aa2e2a95a118143",
+    "D3D11Hook.cpp": "c8374e7d6dd493262deb8261b276616eb702db1fcc2ae96107f1ca5cb0a474e4",
+    "D3D11Hook.Process.InGameSubtitles.inl": "55b064e62bcbecc752797734a3d42cc01f3433bb9aa867b24546cdf2eca45ccd",
+    "D3D11Hook.Process.VideoSubtitles.inl": "b79564e97fca4fe854b5a174501d936ad0af5bbb25be40e72cece5e1b1b67298",
+    "GameAddressProfile.h": "87e4a58c11d192fe4057e121f8fa3693e0ea001fbfadee5165bc8342ad76eb00",
+    "GameAddressPatterns.inl": "fd88c1f5ff773b9e285121cf35652762f96a663fe7e3ea0bf10ed3f5a5679b03",
+    "GameViewport.h": "42025ef3bba38bee0a675aad2cfea4a4b8b233ae79fd8fbd7422647920fe0e12",
+    "verify_addresses.ps1": "bdcaa565bafb7d8b2ef1eb6b935781e78ae9de52032f2ddc13f9b7449c4a1c6d"
+  },
+  "validation": {
+    "archived_normal_build_matches_dll": true,
+    "source_snapshot_matches": true,
+    "encoding_and_address_audit_passed_on_publication": true,
+    "full_campaign_visual_validation": false
+  },
+  "rebuilt_for_github_publication": false
+}

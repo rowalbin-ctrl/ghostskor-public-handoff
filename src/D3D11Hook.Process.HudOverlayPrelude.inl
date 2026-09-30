@@ -85,6 +85,8 @@
             korean.empty()) {
           continue;
         }
+      if (TextHook_UsesNativeBindingPrompt(inst.keyToken) ||
+          TextHook_UsesNativeHudCaption(inst.keyToken)) continue;
 
         std::string runtimeEnglish = inst.rawText;
         if (runtimeEnglish.empty()) {

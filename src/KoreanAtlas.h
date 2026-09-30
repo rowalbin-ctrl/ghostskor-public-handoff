@@ -46,6 +46,11 @@ inline const GlyphInfo *GetGlyph(uint32_t codepoint) {
 
 int GetAtlasWidth(uint8_t slot);
 int GetAtlasHeight(uint8_t slot);
+// Union of Hangul ink boxes relative to the atlas baseline. Determined from
+// the loaded glyph metrics; independent of menu text and screen resolution.
+bool GetHangulBounds(uint8_t slot, float &top, float &bottom);
+// Latin H in the same atlas used to draw the text, for cross-font size matching.
+bool GetCapBounds(uint8_t slot, float &top, float &bottom);
 size_t GetGlyphCount(uint8_t slot);
 
 // UTF-8 Decoder

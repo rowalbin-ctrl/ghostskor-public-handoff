@@ -16,11 +16,7 @@
 // External logging function
 extern void LogToFile(const std::string& msg);
 
-// Credits-guard timing globals (defined in texthook.cpp, global namespace)
-extern std::atomic<DWORD>    g_lastBinkVideoCloseTick;
-extern std::atomic<DWORD>    g_lastBinkVideoOpenTick;
-extern std::atomic<uint64_t> g_presentFrameCount;
-extern std::atomic<uint64_t> g_presentFrameAtLastVideoClose;
+
 
 namespace BinkHook {
 
@@ -684,7 +680,7 @@ BINK* Hooked_BinkOpen(const char* filename, uint32_t flags) {
         
         // DON'T access BINK struct members - layout is unknown and causes crashes!
         // Just log the video name
-        ::g_lastBinkVideoOpenTick.store(GetTickCount(), std::memory_order_relaxed);
+
         LogToFile("[BinkHook] Video opened: " + openedVideoName);
 
         bool cutsceneVideo = false;
@@ -747,10 +743,6 @@ void Hooked_BinkClose(BINK* bink) {
     }
 
     if (matchedCurrent) {
-        ::g_lastBinkVideoCloseTick.store(GetTickCount(), std::memory_order_relaxed);
-        ::g_presentFrameAtLastVideoClose.store(
-            ::g_presentFrameCount.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
         LogToFile("[BinkHook] Video closed: " + closedVideoName);
     }
 }

@@ -1,8 +1,14 @@
 # GhostsKor — Call of Duty: Ghosts 한글패치
 
 Steam **싱글플레이어 빌드 24723416**용 커뮤니티 한글패치의 유지보수 소스입니다.
-현재 개정은 **2026.09.08 R5**입니다. 8월 EXE 대응, HUD 크기와 타이머,
-시작 메뉴 초기화, 조명 설정 및 함수 주소 검증을 보완했습니다.
+현재 배포 개정은 **2026.09.13 R8**입니다. 2026-09-30에 GitHub 소스와
+배포 파일을 갱신했습니다. 메뉴·HUD·게임패드·자막 출력과 DXGI/현지화 처리를
+보완했습니다. [R8 변경 내역과 검증 범위](MAINTENANCE_R8.md)를 확인하세요.
+
+**[한글패치 R8 다운로드](https://github.com/rowalbin-ctrl/ghostskor-public-handoff/releases/tag/v2026.09.13-r8)**
+
+일반 사용자는 릴리스의 `GhostsKor-SteamSP-2026.09.13-R8.zip`을 받으세요.
+GitHub의 자동 생성 `Source code` ZIP은 게임에 설치하는 패치가 아닙니다.
 
 ## 사용 및 지원 범위
 
@@ -20,13 +26,13 @@ Steam **싱글플레이어 빌드 24723416**용 커뮤니티 한글패치의 유
 
 ## 확인된 범위
 
-R2의 일부 불러오기 장면에서 사용자가 한글·타이머 표시와 성능 개선을
-확인했습니다. R5는 x64 빌드와 자동 검사를 통과했지만, R5 실게임 시작,
-조명 값 전환·에이잭스 장면, 4K 시각 검토, 반복 실행 메뉴 정렬 및
-전체 캠페인 검증은 아직 완료하지 않았습니다.
+R8 ZIP의 DLL과 보관된 일반 빌드 및 현재 설치 DLL은 해시가 일치합니다.
+소스 스냅샷 대조와 인코딩·주소 검사를 통과했습니다. 당시의 자막 영역,
+함수 검색 및 회귀 검사 기록은 [R8 문서](MAINTENANCE_R8.md)를 참고하세요.
+전체 캠페인·모든 화면 비율의 실화면 검수 완료를 의미하지 않습니다.
 
-`releases/2026.09.08-R5.json`은 배포 DLL/ZIP의 해시와 검증 범위를 기록합니다.
-이 저장소의 Git 파일에는 배포 DLL과 게임 실행 파일을 포함하지 않습니다.
+`releases/2026.09.13-R8.json`에 배포 파일의 해시와 확인 범위를 기록했습니다.
+DLL은 GitHub Releases에 첨부하며 Git 소스 트리에는 포함하지 않습니다.
 
 ## 빌드
 
@@ -48,6 +54,7 @@ powershell -NoProfile -File .\src\build.ps1 -NoDeploy
 
 ## 유지보수 자료
 
+- [R8: 메뉴·HUD·자막 및 배포 기록](MAINTENANCE_R8.md)
 - [R2: EXE 이식, HUD·타이머](MAINTENANCE_R2.md)
 - [R3: 조명 설정](MAINTENANCE_R3.md)
 - [R4: 조명 재시도 제한](MAINTENANCE_R4.md)
@@ -56,8 +63,8 @@ powershell -NoProfile -File .\src\build.ps1 -NoDeploy
 - [검증 소스와 실행 방법](validation/README.md)
 - [프로젝트 인수인계](MAINTAINER_HANDOFF.md)
 
-R2~R4 문서는 각 개정 당시 기록입니다. 현재 동작과 지원 범위는 이 README,
-R5 문서와 버전 지원 정책을 우선하세요. 기존 SSOT 문서도 이전 구현의 기록입니다.
+R2~R5 문서는 각 개정 당시 기록입니다. 현재 동작과 지원 범위는 이 README,
+R8 문서와 버전 지원 정책을 우선하세요. 기존 SSOT 문서도 이전 구현의 기록입니다.
 
 ## 프로젝트 배경과 포함 파일
 

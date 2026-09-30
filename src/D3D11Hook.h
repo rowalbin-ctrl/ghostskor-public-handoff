@@ -5,7 +5,6 @@
 class D3D11Hook {
 public:
   static void Init();
-  static void InitDXGI();
   static void HookSwapChain(IDXGISwapChain *pSwapChain);
   static void Cleanup();
 };

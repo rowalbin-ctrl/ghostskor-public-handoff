@@ -1,5 +1,7 @@
 param(
   [switch]$NoDeploy,
+  [switch]$MenuTrace,
+  [switch]$TextPerf,
   [string]$ToolchainSetup
 )
 
@@ -86,10 +88,15 @@ $sources = @(
   "GameAddresses.cpp",
   "GameTweaks.cpp",
   "DXGIWrapper.cpp",
+  "DXGIProxy.cpp",
   "D3D11Hook.cpp",
   "BindingResolver.cpp",
+  "NativeGamepad.cpp",
   "GamepadGlyphAtlas.cpp",
   "KoreanRenderer.cpp",
+  "NativeMenuCapture.cpp",
+  "NativeMenuDraw.cpp",
+  "NativeGlyphBridge.cpp",
   "KoreanAtlas.cpp",
   "BinkHook.cpp",
   "FSHook.cpp",
@@ -111,6 +118,8 @@ $clArgs = @(
   "/DGHOSTSKOR_OBJECTIVE_REVERSE=1",
   "/DGHOSTSKOR_LOGGING=0",
   "/DGHOSTSKOR_RUNTIME_DIAG=0"
+) + $(if ($MenuTrace) { @('/DGHOSTSKOR_MENU_TRACE=1') } else { @() }
+) + $(if ($TextPerf) { @('/DGHOSTSKOR_TEXT_PERF=1') } else { @() }
 ) + $sources + @(
   "/I.",
   "/Ivendor/nlohmann",

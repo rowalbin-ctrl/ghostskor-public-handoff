@@ -14,6 +14,12 @@ namespace IW6Offsets {
 // they must never be added to the module base to create a callable pointer.
 // Format: {SP_offset, MP_offset}
 
+// Read-only SP input state, verified against the native lookup and live memory.
+constexpr uintptr_t PadControllerIndex_SP = 0x1980A50;
+constexpr uintptr_t PadProfiles_SP = 0x197E3B0;
+constexpr uintptr_t PadKeyBindings_SP = 0x17C011C;
+constexpr uintptr_t PadCommandNames_SP = 0x7D8220;
+
 // Localization Functions (from iw6x-client localized_strings.cpp)
 // VERIFIED: From iw6x-client src/client/component/localized_strings.cpp line 61
 constexpr uintptr_t SEH_StringEd_GetString_SP = 0x436A20;  // SELECT_VALUE(0x1403F42D0, ...)
@@ -37,6 +43,29 @@ constexpr uintptr_t Cbuf_AddText_MP = 0x3F6B50;
 // NOTE: Offsets can vary across builds/patches. TextHook.cpp validates the
 // prologue and falls back if needed.
 constexpr uintptr_t R_AddCmdDrawText_SP = 0x57DA90;
+constexpr uintptr_t NativeHudTextDraw_SP = 0x230C80;
+constexpr uintptr_t NativeHudTextFx_SP = 0x57DC20;
+constexpr uintptr_t UI_TextWidth_SP = 0x44B1C0;
+constexpr uintptr_t NativeActorNames_SP = 0x223290;
+constexpr uintptr_t NativeObjectiveHeader_SP = 0x244020;
+constexpr uintptr_t NativeObjectiveList_SP = 0x244190;
+constexpr uintptr_t UI_SafeTranslateString_SP = 0x44A130;
+constexpr uintptr_t NativeOwnerDraw_SP = 0x23C6D0;
+constexpr uintptr_t UI_ReplaceConversionString_SP = 0x448AF0;
+constexpr uintptr_t RB_DrawTextQuad_SP = 0x5A4C90;
+constexpr uintptr_t R_GetCharacterGlyph_SP = 0x55BF60;
+constexpr uintptr_t RB_DrawChar_SP = 0x5A2C50;
+constexpr uintptr_t TextPixelAspect_SP = 0x76AFA40;
+// Native text command dispatcher and tessellation flush for ordered UI draws.
+constexpr uintptr_t RB_DrawTextCommand_SP = 0x5A50E0;
+constexpr uintptr_t RB_EndTessSurface_SP = 0x5BD880;
+constexpr uintptr_t TessIndexCount_SP = 0x76AA6C8;
+// Reviewed Steam 24723416 producers: command 7 (x,y,width,height), command 8
+// (reset), and the begin/finish functions surrounding the complete UI list.
+constexpr uintptr_t R_AddCmdSetScissor_SP = 0x57DFA0;
+constexpr uintptr_t R_AddCmdResetScissor_SP = 0x57CF60;
+constexpr uintptr_t R_BeginRenderCommands_SP = 0x57F520;
+constexpr uintptr_t R_FinishRenderCommands_SP = 0x57E2C0;
 constexpr uintptr_t R_AddCmdDrawText_SP_FALLBACK = 0; // No unverified fallback.
 constexpr uintptr_t R_AddCmdDrawText_MP = 0x601070;
 constexpr uintptr_t R_AddCmdDrawTextWithCursor_SP = 0x57DC10;  // Text with cursor (input fields)
@@ -50,6 +79,8 @@ constexpr uintptr_t R_EndFrame_SP = 0x534860;
 constexpr uintptr_t R_EndFrame_MP = 0x601AA0;
 
 // LUI (Lua UI) Functions
+constexpr uintptr_t LUI_RenderText_SP = 0x1FC320;
+constexpr uintptr_t LUI_RenderCachedElement_SP = 0x1FD990;
 constexpr uintptr_t LUI_OpenMenu_SP = 0x3FD460;
 constexpr uintptr_t LUI_OpenMenu_MP = 0x4B3610;
 constexpr uintptr_t LUI_EnterCriticalSection_SP = 0x1AE940;
@@ -112,6 +143,8 @@ constexpr uintptr_t SL_StringTypeCheck_SP = 0x41EE30;
 constexpr uintptr_t ConfigString_Resolve_SP = SL_ConvertToString_SP;
 
 // Video/Cinematic Functions (for loading screen subtitles)
+// Native image rectangle inputs, reviewed in Steam 24723416. Read-only use.
+constexpr uintptr_t R_CinematicRect_SP = 0x535FF0;
 // These are less useful but may help trace video subtitle rendering
 constexpr uintptr_t R_AddCmdDrawStretchPic_SP = 0x234460;
 constexpr uintptr_t R_AddCmdDrawStretchPic_MP = 0x600BE0;

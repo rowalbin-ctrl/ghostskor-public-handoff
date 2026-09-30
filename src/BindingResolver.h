@@ -18,6 +18,9 @@ std::string ResolveBindingsInText(const std::string &text,
 // preserveSingleAsciiAlpha=true keeps single A-Z tokens unchanged.
 std::string LocalizeBindingDisplayText(
     const std::string &text, bool preserveSingleAsciiAlpha = false);
+// Translate only a key display already emitted by the engine. Empty means
+// this is not a binding display (e.g. a whole instruction swallowed as a key).
+std::string LocalizeNativeBindingDisplay(const std::string &text);
 
 // Best-effort key extraction from English prompts (e.g. "Press F to ...").
 std::string ExtractKeyFromEnglish(const std::string &english);

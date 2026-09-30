@@ -5,9 +5,11 @@
 #include "DXGIWrapper.h"
 #include "Detour.h"
 #include "GameViewport.h"
+#include "SubtitleViewport.h"
 #include "KoreanAtlas.h"
 #include "KoreanRenderer.h"
 #include "HudTextRenderer.h"
+#include "SubtitleRing.h"
 #include "GameTweaks.h"
 #include "IW6Offsets.h"
 #include "NativeSubtitleTracker.h"
@@ -54,6 +56,7 @@ struct IW6ScreenPlacement {
   float subScreenLeft[2];         // +0x68
 };
 typedef IW6ScreenPlacement *(*ScrPlace_GetViewPlacement_t)();
+#include "D3D11Hook.SubtitleViewport.inl"
 static ScrPlace_GetViewPlacement_t s_ScrPlace_GetViewPlacement = nullptr;
 
 // Cached ScreenPlacement values (updated per frame)
@@ -224,7 +227,9 @@ static std::string StripColorCodesSimple(const std::string &s) {
 static std::vector<std::string> WrapKoreanText(const std::string &text,
                                                float maxWidth, float fontHeight,
                                                float scale,
-                                               bool rebalanceTwoLine = true) {
+                                               bool rebalanceTwoLine = true,
+                                               float resolutionScale = 1.0f) {
+  const HudTextRenderer textRenderer(1080.0f * resolutionScale);
     auto IsWs = [](uint32_t cp) -> bool {
     return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r';
   };
@@ -233,17 +238,19 @@ static std::vector<std::string> WrapKoreanText(const std::string &text,
     std::string text;
     uint32_t fontBits;
     uint32_t scaleBits;
+    uint32_t resolutionBits;
     uint8_t atlasSlot;
 
     bool operator==(const WidthCacheKey &o) const {
       return fontBits == o.fontBits && scaleBits == o.scaleBits &&
-             atlasSlot == o.atlasSlot && text == o.text;
+             resolutionBits == o.resolutionBits && atlasSlot == o.atlasSlot && text == o.text;
     }
   };
   struct WidthCacheKeyHash {
     size_t operator()(const WidthCacheKey &k) const {
       size_t h = (size_t)k.fontBits;
       h = (h * 1315423911u) ^ (size_t)k.scaleBits;
+      h = (h * 1315423911u) ^ (size_t)k.resolutionBits;
       h = (h * 2654435761u) ^ (size_t)k.atlasSlot;
       h ^= std::hash<std::string>{}(k.text);
       return h;
@@ -258,15 +265,17 @@ static std::vector<std::string> WrapKoreanText(const std::string &text,
                            uint8_t atlasSlot = 0) -> float {
     uint32_t fontBits = 0;
     uint32_t scaleBits = 0;
+    uint32_t resolutionBits = 0;
     memcpy(&fontBits, &fontHeight, sizeof(uint32_t));
     memcpy(&scaleBits, &scale, sizeof(uint32_t));
+    memcpy(&resolutionBits, &resolutionScale, sizeof(uint32_t));
 
-    WidthCacheKey key{s, fontBits, scaleBits, atlasSlot};
+    WidthCacheKey key{s, fontBits, scaleBits, resolutionBits, atlasSlot};
     auto it = widthCache.find(key);
     if (it != widthCache.end()) {
       return it->second;
     }
-    float w = KoreanRenderer::MeasureTextWidthEx(s, fontHeight, scale, atlasSlot);
+    float w = textRenderer.MeasureTextWidthEx(s, fontHeight, scale, atlasSlot);
     widthCache.emplace(std::move(key), w);
     return w;
   };
@@ -487,43 +496,7 @@ static std::vector<std::string> WrapKoreanText(const std::string &text,
 
 static float ComputeSubtitleWrapWidth(float screenWidth, float screenHeight,
                                       bool videoSubtitle) {
-  if (screenWidth <= 1.0f || screenHeight <= 1.0f) {
-    return screenWidth * 0.6f;
-  }
-
-  float aspect = screenWidth / screenHeight;
-  float ratio = videoSubtitle ? 0.56f : 0.62f;
-
-  // Wider aspect ratios should use narrower logical subtitle columns.
-  if (aspect >= 2.30f) {
-    ratio -= 0.09f;
-  } else if (aspect >= 2.00f) {
-    ratio -= 0.07f;
-  } else if (aspect >= 1.85f) {
-    ratio -= 0.04f;
-  } else if (aspect <= 1.45f) {
-    ratio += 0.05f;
-  }
-
-  float minRatio = videoSubtitle ? 0.42f : 0.48f;
-  float maxRatio = videoSubtitle ? 0.68f : 0.74f;
-  ratio = std::clamp(ratio, minRatio, maxRatio);
-
-  float safeMarginX = (std::max)(24.0f, screenWidth * 0.045f);
-  float safeWidth = (std::max)(120.0f, screenWidth - safeMarginX * 2.0f);
-
-  float wrapWidth = screenWidth * ratio;
-  if (wrapWidth > safeWidth) {
-    wrapWidth = safeWidth;
-  }
-
-  float minWidth =
-      (std::max)(220.0f, screenWidth * (videoSubtitle ? 0.38f : 0.44f));
-  if (wrapWidth < minWidth) {
-    wrapWidth = minWidth;
-  }
-
-  return wrapWidth;
+  return SubtitleViewport::WrapWidth(screenWidth, screenHeight, videoSubtitle);
 }
 
 static float ComputeVideoSubtitleScale(float screenWidth, float screenHeight) {
@@ -535,259 +508,6 @@ static float ComputeVideoSubtitleScale(float screenWidth, float screenHeight) {
   // no upper clamp so text scales proportionally at 1440p / 4K / etc.
   if (resRatio < 0.88f) resRatio = 0.88f;
   return 2.5f * resRatio;
-}
-
-static std::string ReplaceFakeIntroSeconds(const std::string &s, DWORD now,
-                                           DWORD introStart) {
-  const std::string token = "[{FAKE_INTRO_SECONDS:";
-  std::string out;
-  size_t pos = 0;
-  while (true) {
-    size_t start = s.find(token, pos);
-    if (start == std::string::npos) {
-      out.append(s.substr(pos));
-      break;
-    }
-    out.append(s.substr(pos, start - pos));
-    size_t numStart = start + token.size();
-    size_t end = s.find("}]", numStart);
-    if (end == std::string::npos) {
-      out.append(s.substr(start));
-      break;
-    }
-    std::string numStr = s.substr(numStart, end - numStart);
-    int base = atoi(numStr.c_str());
-    int num = base;
-    if (introStart > 0) {
-      DWORD elapsed = now - introStart;
-      num = (base + (int)(elapsed / 1000)) % 60;
-    }
-    char buf[4];
-    sprintf_s(buf, "%02d", num);
-    out.append(buf);
-    pos = end + 2;
-  }
-  return out;
-}
-
-static bool IsIntroPlaceholderLine(const std::string &s) {
-  std::string t = TrimAscii(s);
-  if (t.empty())
-    return true;
-  std::string lower;
-  lower.reserve(t.size());
-  for (char c : t) {
-    lower.push_back((char)std::tolower((unsigned char)c));
-  }
-  return (lower == "line2" || lower == "line3" || lower == "line4");
-}
-
-static bool LooksLikeIntroDate(const std::string &s) {
-  if (s.find(':') != std::string::npos)
-    return true;
-  if (s.find("June") != std::string::npos || s.find("July") != std::string::npos ||
-      s.find("August") != std::string::npos || s.find("May") != std::string::npos)
-    return true;
-  // Any digit + "/" or "-" pattern
-  for (char c : s) {
-    if (std::isdigit((unsigned char)c))
-      return true;
-  }
-  return false;
-}
-
-static bool LooksLikeIntroLocation(const std::string &s) {
-  if (s.find(",") != std::string::npos)
-    return true;
-  return false;
-}
-
-static bool LooksLikeIntroName(const std::string &s) {
-  std::string t = TrimAscii(s);
-  if (t.empty())
-    return false;
-  if (t.front() == '"' || t.back() == '"')
-    return true;
-  // Short non-numeric line without time/location hints
-  if (t.size() <= 18 && t.find(':') == std::string::npos &&
-      t.find(",") == std::string::npos) {
-    for (char c : t) {
-      if (std::isdigit((unsigned char)c))
-        return false;
-    }
-    return true;
-  }
-  return false;
-}
-
-static bool LooksLikeTimeChyron(const std::string &s) {
-  if (s.find(':') != std::string::npos)
-    return true;
-  if (s.find("minutes") != std::string::npos || s.find("minute") != std::string::npos ||
-      s.find("hours") != std::string::npos || s.find("hour") != std::string::npos ||
-      s.find("years") != std::string::npos || s.find("year") != std::string::npos)
-    return true;
-  return false;
-}
-
-// LUI fallback positions for hint prompts (from sp_hud/gameinfo.dec.lua)
-enum LuiHintSlot {
-  LUI_HINT_SLOT_NONE = -1,
-  LUI_HINT_SLOT_MANTLE = 0,
-  LUI_HINT_SLOT_CURSOR = 1,
-  LUI_HINT_SLOT_INVALID = 2,
-  LUI_HINT_SLOT_BREATH = 3,
-  LUI_HINT_SLOT_ZOOM = 4,
-  LUI_HINT_SLOT_TOGGLE = 5,
-  LUI_HINT_SLOT_COUNT = 6
-};
-
-static bool GetLuiHintPosition(const std::string &key, float screenWidth,
-                               float screenHeight, float &outX, float &outY,
-                               int *outSlot = nullptr) {
-  if (key.find("INTROSCREEN") != std::string::npos) {
-    return false;
-  }
-
-  // Use the 16:9 active area for scaling and positioning so that hints
-  // land within the game's actual rendering region, not the letterbox area.
-  const float activeW = (g_ActiveArea.width > 1.0f) ? g_ActiveArea.width : screenWidth;
-  const float activeH = (g_ActiveArea.height > 1.0f) ? g_ActiveArea.height : screenHeight;
-  const float activeOffY = g_ActiveArea.offsetY;
-
-  float scaleY = activeH / 720.0f;
-  float centerX = screenWidth * 0.5f;
-
-  // LUI hint containers are 64px tall in 720p space.
-  // IMPORTANT: KoreanRenderer expects baseline Y. The previous implementation
-  // used container center (+32), which renders too high ("above English").
-  // Baseline offset is tuned from native draw capture:
-  // cursorHint top=720-160-64=496, native baseline ~539 => +43 from top.
-  constexpr float kHintHeight720 = 64.0f;
-  constexpr float kBaselineFromTop720 = 43.0f;
-
-  // safeTop/safeBottom define the 16:9 active area within the backbuffer.
-  float safeTop = activeOffY;
-  float safeBottom = activeOffY + activeH;
-
-  auto SetTop = [&](int slot, float top) -> bool {
-    outX = centerX;
-    outY = safeTop + (top + kBaselineFromTop720) * scaleY;
-    if (outSlot) *outSlot = slot;
-    return true;
-  };
-
-  auto SetBottom = [&](int slot, float bottomAbs) -> bool {
-    outX = centerX;
-    outY =
-        safeBottom - (bottomAbs + (kHintHeight720 - kBaselineFromTop720)) * scaleY;
-    if (outSlot) *outSlot = slot;
-    return true;
-  };
-
-  // --- LUI ownerdraw hints (exact positions from gameinfo.dec.lua) ---
-  // mantleHint: bottomAnchor, bottom=-80, height=64 ??text center at 720-(80+32)=608
-  if (key.find("MANTLE") != std::string::npos) {
-    return SetBottom(LUI_HINT_SLOT_MANTLE, 80.0f);
-  }
-  // cursorHint: bottomAnchor, bottom=-160, height=64 ??text center at 720-(160+32)=528
-  if (key.find("CURSOR") != std::string::npos &&
-      key.find("CORNERED") == std::string::npos) {
-    return SetBottom(LUI_HINT_SLOT_CURSOR, 160.0f);
-  }
-  // PLATFORM_* prompts: cursorHint slot.
-  // EXCEPT PLATFORM_STANCEHINT_* — stance hints are hintprint() center-screen prompts,
-  // not cursorHint interaction prompts. Let them fall through to renderer center default.
-  if (key.rfind("PLATFORM_", 0) == 0 &&
-      key.find("STANCEHINT") == std::string::npos) {
-    return SetBottom(LUI_HINT_SLOT_CURSOR, 160.0f);
-  }
-  // invalidCmdHint: topAnchor, top=138, height=64 ??text center at 138+32=170
-  if (key.find("INVALID") != std::string::npos) {
-    return SetTop(LUI_HINT_SLOT_INVALID, 138.0f);
-  }
-  // breathHint: topAnchor, top=40, height=64 ??text center at 40+32=72
-  if (key.find("BREATH") != std::string::npos) {
-    return SetTop(LUI_HINT_SLOT_BREATH, 40.0f);
-  }
-  // zoomHint: topAnchor, top=70, height=64 ??text center at 70+32=102
-  // NOT binoculars/cornered zoom
-  if (key.find("ZOOM") != std::string::npos &&
-      key.find("CORNERED") == std::string::npos &&
-      key.find("BINOCULAR") == std::string::npos) {
-    return SetTop(LUI_HINT_SLOT_ZOOM, 70.0f);
-  }
-  // toggleHybridHint / toggleThermalHint: topAnchor, top=40, height=64
-  if (key.find("HYBRID") != std::string::npos ||
-      key.find("THERMAL") != std::string::npos) {
-    return SetTop(LUI_HINT_SLOT_TOGGLE, 40.0f);
-  }
-
-  // --- CORNERED_ action prompts: cursorHint position by default ---
-  // Most CORNERED_ prompts appear at the cursorHint location
-  if (key.find("CORNERED_") != std::string::npos) {
-    // CORNERED objective lines are top-left objective text, not hint slots.
-    if (key.rfind("CORNERED_OBJ_", 0) == 0 ||
-        key.rfind("CORNERED_OBJECTIVE_", 0) == 0) {
-      return false;
-    }
-    // Fail messages are center-screen overlays; don't reposition here.
-    if (key.find("_FAIL") != std::string::npos ||
-        key.find("FAIL_") != std::string::npos ||
-        key.find("_KILLED") != std::string::npos ||
-        key.find("GOT_AWAY") != std::string::npos) {
-      return false;
-    }
-    if (key.find("BINOCULAR") != std::string::npos) {
-      // Binocular hints are not cursorHint interaction prompts.
-      // Keep them on the scanner/general HUD track (handled by fallback/native).
-      return false;
-    }
-    // Scanning/status messages (SCANNING, IDENTIFIED, MATCH, etc): center
-    if (key.find("SCANNING") != std::string::npos ||
-        key.find("IDENTIFIED") != std::string::npos ||
-        key.find("MATCH") != std::string::npos ||
-        key.find("READY") != std::string::npos ||
-        key.find("DATA") != std::string::npos ||
-        key.find("_DOT_") != std::string::npos ||
-        key.find("DEGREE_SYMBOL") != std::string::npos ||
-        key.find("E3_TIME") != std::string::npos) {
-      // These are HUD-status overlays; don't reposition, use default
-      return false;
-    }
-    // Default CORNERED_ action prompts: cursorHint position
-    return SetBottom(LUI_HINT_SLOT_CURSOR, 160.0f);
-  }
-
-  // Generic _HINT fallback: mission-specific hints (e.g., ODIN_INTRO_BUMPER_HINT_PC)
-  // that don't match any specific pattern above ??cursorHint position.
-  if (key.find("_HINT") != std::string::npos || key.rfind("HINT_", 0) == 0) {
-    return SetBottom(LUI_HINT_SLOT_CURSOR, 160.0f);
-  }
-
-  return false;
-}
-
-static float PulseAlpha(DWORD now, float periodMs, float minA, float maxA,
-                        float phase) {
-  float t = (float)(now % (DWORD)periodMs) / periodMs;
-  float s = sinf(6.2831853f * (t + phase));
-  float v = (s * 0.5f + 0.5f);
-  return minA + (maxA - minA) * v;
-}
-
-// GSC-style quick_pulse: every 50ms alpha = random(base*0.7, base)
-// Uses hash-based pseudo-random to be deterministic per-entry per-tick.
-static float QuickPulseAlpha(DWORD now, float base, uint32_t seed) {
-  // Change every 50ms (GSC: wait 0.05)
-  uint32_t tick = (uint32_t)(now / 50);
-  // Simple hash for pseudo-random
-  uint32_t h = tick ^ seed;
-  h = h * 2654435761u; // Knuth multiplicative hash
-  h = (h >> 16) ^ h;
-  float t = (float)(h & 0xFFFF) / 65535.0f; // 0..1
-  float lo = base * 0.7f;
-  return lo + (base - lo) * t;
 }
 
 static void ConvertHudNativeToScreen(float nativeX, float nativeY,
@@ -1117,7 +837,9 @@ void D3D11Hook_ProcessSubtitles(IDXGISwapChain *pSwapChain) {
   auto QueueSubtitleReadabilityPass =
       [&](const std::string &rawLine, float x, float y, float scaleNow,
           float fontHeightNow, float widthNow, float baseAlpha,
-          const float nameColor[4], const float nameGlowColor[4]) {
+          const float nameColor[4], const float nameGlowColor[4],
+          float resolutionScale = 1.0f) {
+        const HudTextRenderer textRenderer(1080.0f * resolutionScale);
         if (baseAlpha <= 0.003f)
           return;
 
@@ -1129,16 +851,16 @@ void D3D11Hook_ProcessSubtitles(IDXGISwapChain *pSwapChain) {
               float strokeColor[4] = {0.0f, 0.0f, 0.0f, strokeA};
               float strokeOff = (std::max)(0.75f, 0.90f * scaleNow);
 
-              KoreanRenderer::QueueText(plain, x - strokeOff, y, scaleNow,
+              textRenderer.QueueText(plain, x - strokeOff, y, scaleNow,
                                         strokeColor, fontHeightNow, 0, widthNow,
                                         true, false, 2.0f, true);
-              KoreanRenderer::QueueText(plain, x + strokeOff, y, scaleNow,
+              textRenderer.QueueText(plain, x + strokeOff, y, scaleNow,
                                         strokeColor, fontHeightNow, 0, widthNow,
                                         true, false, 2.0f, true);
-              KoreanRenderer::QueueText(plain, x, y - strokeOff, scaleNow,
+              textRenderer.QueueText(plain, x, y - strokeOff, scaleNow,
                                         strokeColor, fontHeightNow, 0, widthNow,
                                         true, false, 2.0f, true);
-              KoreanRenderer::QueueText(plain, x, y + strokeOff, scaleNow,
+              textRenderer.QueueText(plain, x, y + strokeOff, scaleNow,
                                         strokeColor, fontHeightNow, 0, widthNow,
                                         true, false, 2.0f, true);
             }
@@ -1146,7 +868,7 @@ void D3D11Hook_ProcessSubtitles(IDXGISwapChain *pSwapChain) {
             float blurA = Clamp01(baseAlpha * 0.05f);
             if (blurA > 0.003f) {
               float blurColor[4] = {0.0f, 0.0f, 0.0f, blurA};
-              KoreanRenderer::QueueText(plain, x, y + (0.55f * scaleNow),
+              textRenderer.QueueText(plain, x, y + (0.55f * scaleNow),
                                         scaleNow * 1.005f, blurColor,
                                         fontHeightNow, 0, widthNow, true, false,
                                         2.0f, true);
@@ -1165,7 +887,7 @@ void D3D11Hook_ProcessSubtitles(IDXGISwapChain *pSwapChain) {
         // Name ghost should include ':' and use ^2 pass so renderer's blurred
         // glow path also contributes (closer to native look).
         float nameWidth =
-            KoreanRenderer::MeasureTextWidthEx(nameSeg, fontHeightNow, scaleNow);
+            textRenderer.MeasureTextWidthEx(nameSeg, fontHeightNow, scaleNow);
         float ghostR = Clamp01(nameColor[0] * 0.25f + nameGlowColor[0] * 0.75f);
         float ghostG = Clamp01(
             (nameColor[1] * 0.32f + nameGlowColor[1] * 0.68f) * 1.22f);
@@ -1189,34 +911,24 @@ void D3D11Hook_ProcessSubtitles(IDXGISwapChain *pSwapChain) {
         ghostStyleA.glowG = 0.0f;
         ghostStyleA.glowB = 0.0f;
         ghostStyleA.glowA = 1.22f;
-        KoreanRenderer::QueueText(nameSeg, x - left1, y, scaleNow * 1.01f,
+        textRenderer.QueueText(nameSeg, x - left1, y, scaleNow * 1.01f,
                                   ghostColorA, fontHeightNow, 0, nameWidth, true,
                                   false, 2.0f, true, false, false, -1, 0.0f, false,
                                   false, 0, &ghostStyleA);
 
         DrawStylePatch ghostStyleB = ghostStyleA;
         ghostStyleB.glowA = 1.05f;
-        KoreanRenderer::QueueText(nameSeg, x - left2,
+        textRenderer.QueueText(nameSeg, x - left2,
                                   y + (0.10f * scaleNow), scaleNow * 1.02f,
                                   ghostColorB, fontHeightNow, 0, nameWidth, true,
                                   false, 2.0f, true, false, false, -1, 0.0f, false,
                                   false, 0, &ghostStyleB);
       };
 
+  const auto subtitleAreas = ReadSubtitleAreas(
+      g_FrameSwapChainDescValid ? float(g_FrameSwapChainDesc.BufferDesc.Width) : 0,
+      g_FrameSwapChainDescValid ? float(g_FrameSwapChainDesc.BufferDesc.Height) : 0);
+
   #include "D3D11Hook.Process.VideoSubtitles.inl"
   #include "D3D11Hook.Process.InGameSubtitles.inl"
-    const HudTextRenderer hudText(g_ActiveArea.height);
-  #include "D3D11Hook.Process.IntroOverlay.inl"
-  #include "D3D11Hook.Process.HudOverlayPrelude.inl"
-  #include "D3D11Hook.Process.TimeScript.inl"
-    #include "D3D11Hook.Process.DedicatedHint.inl"
-    #include "D3D11Hook.Process.DedicatedObjHudHint.inl"
-  }
 }
-
-
-
-
-
-
-

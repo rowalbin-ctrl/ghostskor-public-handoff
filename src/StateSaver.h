@@ -15,6 +15,7 @@ class D3D11StateSaver {
 
   // Shader Stages
   ID3D11VertexShader *m_pVS;
+  ID3D11Buffer *m_pVSConstantBuffer0;
   ID3D11PixelShader *m_pPS;
   ID3D11GeometryShader *m_pGS;
   ID3D11HullShader *m_pHS;
@@ -57,6 +58,7 @@ public:
   D3D11StateSaver(ID3D11DeviceContext *pContext)
       : m_pContext(pContext), m_saved(false) {
     m_pVS = nullptr;
+    m_pVSConstantBuffer0 = nullptr;
     m_pPS = nullptr;
     m_pGS = nullptr;
     m_pHS = nullptr;
@@ -90,6 +92,7 @@ public:
 
     // Shaders
     m_pContext->VSGetShader(&m_pVS, NULL, NULL);
+    m_pContext->VSGetConstantBuffers(0, 1, &m_pVSConstantBuffer0);
     m_pContext->PSGetShader(&m_pPS, NULL, NULL);
     m_pContext->GSGetShader(&m_pGS, NULL, NULL);
     m_pContext->HSGetShader(&m_pHS, NULL, NULL);
@@ -130,6 +133,7 @@ public:
 
     // Shaders
     m_pContext->VSSetShader(m_pVS, NULL, 0);
+    m_pContext->VSSetConstantBuffers(0, 1, &m_pVSConstantBuffer0);
     m_pContext->PSSetShader(m_pPS, NULL, 0);
     m_pContext->GSSetShader(m_pGS, NULL, 0);
     m_pContext->HSSetShader(m_pHS, NULL, 0);
@@ -165,6 +169,10 @@ public:
   }
 
   void Release() {
+    if (m_pVSConstantBuffer0) {
+      m_pVSConstantBuffer0->Release();
+      m_pVSConstantBuffer0 = nullptr;
+    }
     if (m_pVS) {
       m_pVS->Release();
       m_pVS = nullptr;

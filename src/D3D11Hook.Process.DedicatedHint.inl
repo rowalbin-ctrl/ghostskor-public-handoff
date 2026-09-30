@@ -62,7 +62,7 @@
     }
     const bool hintOverlayVisible =
         ((!hintEntries.empty() || hasActivePromptFadeHold()) &&
-         !suppressHudOverlay && !gate.creditsActive &&
+         !suppressHudOverlay &&
          !hintRestartSuppressed && !hintPostVideoSuppressed);
     if (hintOverlayVisible) {
       constexpr float kHintHeight720 = 64.0f;
@@ -1157,6 +1157,8 @@
           const int i = renderOrder[orderIndex];
           const auto &he = hintEntries[i];
           const std::string &key = he.key;
+
+          if (TextHook_UsesNativeHudCaption(key)) continue;
 
           if (!isHintRenderable(he)) continue;
           const int nativeSlot =

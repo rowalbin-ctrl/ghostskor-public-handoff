@@ -1,7 +1,7 @@
 // =============================================================================
 // FSHook.cpp - Intercept DB_FindXAssetHeader for:
 //   1. subtitles.csv (STRINGTABLE) - Extract video subtitles
-//   2. INTROSCREEN (LOCALIZE) - Suppress English + queue Korean overlay
+//   2. LOCALIZE - Register original content without changing asset values
 // =============================================================================
 
 #include "FSHook.h"
@@ -9,8 +9,6 @@
 #include "Detour.h"
 #include "IW6Offsets.h"
 #include "TextHook.h"
-#include "HudClassify.h"
-#include "ObjectiveRendererUnified.h"
 #include "Utils.h"
 #include <algorithm>
 #include <cctype>
@@ -26,9 +24,6 @@ namespace FSHook {
 // Asset Types (IW6)
 static const int ASSET_TYPE_STRINGTABLE = 0x2E; // 46
 static const int ASSET_TYPE_LOCALIZE = 0x21;    // 33 - Localization strings
-
-// Blank string for suppressing localized entries
-static const char *kIntroBlank = " ";
 
 // StringTable Structures (iw6x-client)
 struct StringTableCell {
@@ -129,51 +124,9 @@ static bool ParseDouble(const std::string &text, double &outVal) {
 }
 
 static std::string ToUpperCopy(const std::string &s) {
-  std::string out = s;
-  std::transform(out.begin(), out.end(), out.begin(),
-                 [](unsigned char c) { return (char)toupper(c); });
+  std::string out=s;
+  std::transform(out.begin(),out.end(),out.begin(),[](unsigned char c){return (char)toupper(c);});
   return out;
-}
-
-static bool ShouldTreatAsGameplayHudKey(const char *name) {
-  if (!name) {
-    return false;
-  }
-
-  const HudKeyType t = ClassifyHudKey(std::string(name));
-  if (t == HUD_KEY_EXCLUDE || t == HUD_KEY_MENU || t == HUD_KEY_INTRO ||
-      t == HUD_KEY_SUBTITLE || t == HUD_KEY_UNKNOWN) {
-    return false;
-  }
-  return true;
-}
-// Hints/prompts should be driven by runtime draw/SLC lifecycle, not by
-// DB_FindXAssetHeader lookups (which can fire outside active rendering).
-static bool IsRuntimeManagedHintKey(const char *name) {
-  if (!name)
-    return false;
-
-  if (strncmp(name, "PLATFORM_", 9) == 0)
-    return true;
-  if (strncmp(name, "SCRIPT_HINT_", 12) == 0)
-    return true;
-  if (strncmp(name, "SCRIPT_PLATFORM_HINT_", 21) == 0)
-    return true;
-  if (strncmp(name, "HINT_", 5) == 0)
-    return true;
-  if (strstr(name, "_HINT") != nullptr)
-    return true;
-
-  if (strncmp(name, "CORNERED_", 9) == 0) {
-    // Objective list/header keys remain in DB path (non-hint top-left track).
-    if (strncmp(name, "CORNERED_OBJ_", 13) == 0 ||
-        strncmp(name, "CORNERED_OBJECTIVE_", 19) == 0) {
-      return false;
-    }
-    return true;
-  }
-
-  return false;
 }
 
 static std::string ReadLocalizeValue(void *header, const char *assetName) {
@@ -223,123 +176,7 @@ static std::string ReadLocalizeValue(void *header, const char *assetName) {
   return TrimAscii(b);
 }
 
-static std::string ExtractObjectiveNamespace(const char *name) {
-  if (!name || !name[0]) {
-    return std::string();
-  }
-  if (strncmp(name, "GAME_", 5) == 0 ||
-      strncmp(name, "CGAME_", 6) == 0 ||
-      strncmp(name, "EXE_", 4) == 0 ||
-      strncmp(name, "MENU_", 5) == 0 ||
-      strncmp(name, "LUA_", 4) == 0 ||
-      strncmp(name, "PLATFORM_", 9) == 0 ||
-      strncmp(name, "HINT_", 5) == 0 ||
-      strncmp(name, "SCRIPT_", 7) == 0) {
-    return std::string();
-  }
-
-  const std::string key(name);
-  const size_t first = key.find('_');
-  if (first == std::string::npos) {
-    return key;
-  }
-  const size_t second = key.find('_', first + 1);
-  if (second != std::string::npos && first <= 5) {
-    return key.substr(0, second);
-  }
-  return key.substr(0, first);
-}
-
-static bool ShouldAcceptForceGameplayByNamespace(const char *name, DWORD now) {
-  const std::string candidateNs = ExtractObjectiveNamespace(name);
-  if (candidateNs.empty()) {
-    // Force-prewarm must stay mission-objective scoped.
-    // Empty namespace corresponds to global/UI/LUA-style keys.
-    return false;
-  }
-
-  std::vector<ObjectiveOverlayEntry> active = TextHook_GetObjectiveEntries();
-  std::unordered_set<std::string> activeNs;
-  activeNs.reserve(8);
-  for (const auto &e : active) {
-    if (e.key.empty()) {
-      continue;
-    }
-    if (e.channel != OBJ_CHANNEL_GAMEPLAY_LIST &&
-        e.channel != OBJ_CHANNEL_GAMEPLAY_UPDATE) {
-      continue;
-    }
-    unsigned long age = (now >= e.lastSeen) ? (now - e.lastSeen) : 0;
-    if (age > 12000) {
-      continue;
-    }
-    const std::string ns = ExtractObjectiveNamespace(e.key.c_str());
-    if (!ns.empty()) {
-      activeNs.insert(ns);
-    }
-  }
-
-  if (activeNs.empty()) {
-    return true;
-  }
-  return activeNs.find(candidateNs) != activeNs.end();
-}
-
-static bool IsObjectiveLoadingPhaseLikely() {
-  const DWORD now = GetTickCount();
-  const unsigned long nativeTick = TextHook_GetNativeObjectiveItemsTick();
-  if (nativeTick == 0) {
-    return true;
-  }
-  if (now < nativeTick) {
-    return true;
-  }
-  return (now - nativeTick) > 1600;
-}
-
-// =============================================================================
-// SuppressIntroLocalize - Blank the English value in a LocalizeEntry
-// so the game's typewriter renderer shows nothing (Korean overlay replaces it)
-// =============================================================================
-static void SuppressIntroLocalize(void *header, const char *assetName) {
-  if (!header || !assetName)
-    return;
-
-  LocalizeEntry *entry = (LocalizeEntry *)header;
-
-  // Detect field order by matching assetName against both fields
-  std::string nameA = SafeReadString(entry->value, 256);
-  std::string nameB = SafeReadString(entry->name, 256);
-
-  const char **valuePtr = nullptr;
-
-  if (!nameA.empty() && _stricmp(nameA.c_str(), assetName) == 0) {
-    // entry->value contains the key name -> entry->name is the actual value
-    valuePtr = &entry->name;
-  } else if (!nameB.empty() && _stricmp(nameB.c_str(), assetName) == 0) {
-    // entry->name contains the key name -> entry->value is the actual value
-    valuePtr = &entry->value;
-  } else {
-    // Neither field matches - try the default (value is the text to blank)
-    valuePtr = &entry->value;
-  }
-
-  if (!valuePtr)
-    return;
-
-  // Patch the value pointer to blank string
-  DWORD oldProtect = 0;
-  if (VirtualProtect((void *)valuePtr, sizeof(const char *),
-                     PAGE_READWRITE, &oldProtect)) {
-    *valuePtr = kIntroBlank;
-    VirtualProtect((void *)valuePtr, sizeof(const char *), oldProtect,
-                   &oldProtect);
-  }
-}
-
-// =============================================================================
-// Extract subtitles from StringTable (subtitles.csv)
-// =============================================================================
+// Extract video subtitles from the original table.
 static void ExtractSubtitlesFromTable(StringTable *table) {
   if (!table || table->rowCount <= 0 || table->columnCount <= 0 ||
       !table->values) {
@@ -460,179 +297,16 @@ static void *Hooked_DB_FindXAssetHeader(int type, const char *name,
     return originalResult;
   }
 
-  // =========================================================================
-  // 2. Handle intro-overlay LOCALIZE keys - suppress English, queue Korean overlay
-  // =========================================================================
-  if (type == ASSET_TYPE_LOCALIZE && name &&
-      ClassifyHudKey(std::string(name)) == HUD_KEY_INTRO) {
-    void *originalResult =
-        g_Original_DB_FindXAssetHeader(type, name, allowCreateDefault);
-
-    if (originalResult) {
-      // Repeated DB localize lookups for the same intro key can continue well
-      // past the actual intro card, especially across SATFARM's section
-      // transitions. Keep English suppression active on every lookup, but only
-      // re-queue the same key for the Korean overlay a few times per second.
-      bool shouldQueueIntroKey = true;
-      {
-        static std::mutex s_introQueueThrottleMutex;
-        static std::unordered_map<std::string, DWORD> s_introQueueTick;
-        const DWORD nowIntro = GetTickCount();
-        const std::string introKey(name);
-        std::lock_guard<std::mutex> lk(s_introQueueThrottleMutex);
-        auto itTick = s_introQueueTick.find(introKey);
-        if (itTick != s_introQueueTick.end() &&
-            nowIntro >= itTick->second &&
-            (nowIntro - itTick->second) < 250) {
-          shouldQueueIntroKey = false;
-        } else {
-          s_introQueueTick[introKey] = nowIntro;
-        }
-        if (s_introQueueTick.size() > 128) {
-          for (auto it = s_introQueueTick.begin();
-               it != s_introQueueTick.end();) {
-            if (nowIntro >= it->second && (nowIntro - it->second) > 30000) {
-              it = s_introQueueTick.erase(it);
-            } else {
-              ++it;
-            }
-          }
-        }
-      }
-      if (shouldQueueIntroKey) {
-        TextHook_OnIntroKey(name);
-      }
-
-      // Suppress English text (blank the value pointer)
-      SuppressIntroLocalize(originalResult, name);
-
-      // Log (throttled)
-      static int introLogCount = 0;
-      if (introLogCount < 100) {
-        introLogCount++;
-        LogToFile("[FSHook] INTRO suppressed+queued: " + std::string(name));
-      }
-    }
-
-    return originalResult;
-  }
-
-  // =========================================================================
-  // 3. Handle gameplay HUD LOCALIZE keys (objectives, hints, game messages)
-  //    Safe keys only: NOT MENU_, PLATFORM_, MP_ (those are used in menus)
-  // =========================================================================
-  if (type == ASSET_TYPE_LOCALIZE && name && ShouldTreatAsGameplayHudKey(name)) {
-    void *originalResult =
-        g_Original_DB_FindXAssetHeader(type, name, allowCreateDefault);
-
-    if (originalResult) {
-      std::string englishValue = ReadLocalizeValue(originalResult, name);
-      TextHook_RegisterRuntimeEnglishKey(name, englishValue.c_str());
-      const bool loadingPhaseLikely = IsObjectiveLoadingPhaseLikely();
-      TextHook_OnObjectiveLocalizeLookup(
-          name, englishValue.c_str(), loadingPhaseLikely, false);
-      // Runtime-managed hint channels (PLATFORM_ / *_HINT / prompt-style keys)
-      // must NOT be queued from DB localize lookups.
-      //
-      // DB_FindXAssetHeader lookups fire in menus/front-end and can inject
-      // menu-only key labels (e.g. PLATFORM_KB_SECONDARY_BUTTON = ESC) into
-      // gameplay HUD hint overlays. Real hint lifecycle must come from
-      // runtime draw/SLC paths only (HUD560/AddCmd/SLC).
-      if (IsRuntimeManagedHintKey(name)) {
-        return originalResult;
-      }
-
-      // TextHook_OnHudKey returns true if Korean translation was found
-      if (TextHook_OnHudKey(name)) {
-        // DO NOT suppress English — kept visible for comparison/debugging.
-        // Suppressing breaks: pause menu objectives (ADDCMD matches English),
-        // native typewriter effect (engine has nothing to render).
-        // SuppressIntroLocalize(originalResult, name);
-
-        // Direct status event emission for save/status messages.
-        // DB_FindXAssetHeader fires exactly once per real save event — the
-        // most reliable signal.  This replaces the probe-based detection
-        // that created ghost "게임 저장됨" messages from persistent HudElems.
-        {
-          const std::string nameStr(name);
-          if (nameStr == "EXE_GAMESAVED" || nameStr == "CGAME_NOW_SAVING") {
-            TextHook_RecordObjectiveStatusEvent(nameStr, 0, "fshook_direct", 0);
-            // NEW: Also feed the unified renderer.
-            ObjUnified_RecordStatusEvent(nameStr, 0, "fshook_direct");
-          }
-        }
-
-        // Log (throttled)
-        static int hudLogCount = 0;
-        if (hudLogCount < 200) {
-          hudLogCount++;
-          LogToFile("[FSHook] HUD queued (English visible): " + std::string(name));
-        }
-      }
-    }
-
-    return originalResult;
-  }
-
-  // =========================================================================
-  // 4. Handle all other LOCALIZE keys for load-phase objective prewarm
-  // =========================================================================
+  // A localization lookup is content access, not a display event. In particular,
+  // do not blank intro assets, prewarm objectives, enqueue status messages or
+  // infer visibility from mission namespaces here. The final renderer owns it.
   if (type == ASSET_TYPE_LOCALIZE && name) {
-    void *originalResult =
-        g_Original_DB_FindXAssetHeader(type, name, allowCreateDefault);
-
-    if (originalResult) {
-      std::string englishValue = ReadLocalizeValue(originalResult, name);
-      TextHook_RegisterRuntimeEnglishKey(name, englishValue.c_str());
-      const bool loadingPhaseLikely = IsObjectiveLoadingPhaseLikely();
-      const HudKeyType t = ClassifyHudKey(std::string(name));
-      bool forceGameplayList = (t == HUD_KEY_OBJECTIVE_LIST ||
-                                t == HUD_KEY_OBJECTIVE_UPDATE ||
-                                t == HUD_KEY_GAME_SAVED ||
-                                t == HUD_KEY_NOW_SAVING);
-
-      const DWORD now = GetTickCount();
-      const unsigned long nativeObjTick = TextHook_GetNativeObjectiveItemsTick();
-      const bool nativeObjectiveLive =
-          (nativeObjTick != 0 &&
-           now >= nativeObjTick &&
-           (now - nativeObjTick) <= 1800);
-      const bool namespaceAllowed =
-          ShouldAcceptForceGameplayByNamespace(name, now);
-
-      if (forceGameplayList && namespaceAllowed &&
-          (loadingPhaseLikely || nativeObjectiveLive)) {
-        TextHook_OnObjectiveLocalizeLookup(
-            name, englishValue.c_str(), loadingPhaseLikely, true);
-
-        static std::unordered_map<std::string, DWORD> s_loadCandLogTick;
-        const DWORD now = GetTickCount();
-        std::string sig = std::string(name) + "|" +
-                          (loadingPhaseLikely ? "1" : "0");
-        auto it = s_loadCandLogTick.find(sig);
-        if (it == s_loadCandLogTick.end() || (now - it->second) > 2500) {
-          s_loadCandLogTick[sig] = now;
-          if (s_loadCandLogTick.size() > 600) {
-            for (auto it2 = s_loadCandLogTick.begin();
-                 it2 != s_loadCandLogTick.end();) {
-              if ((now - it2->second) > 30000) {
-                it2 = s_loadCandLogTick.erase(it2);
-              } else {
-                ++it2;
-              }
-            }
-          }
-
-          char buf[512];
-          sprintf_s(buf,
-                    "[FSHOOK-LOAD-CAND] key=%s load=%d eng=\"%.96s\"",
-                    name, loadingPhaseLikely ? 1 : 0, englishValue.c_str());
-          LogToFile(buf);
-        }
-      }
+    void *result=g_Original_DB_FindXAssetHeader(type,name,allowCreateDefault);
+    if (result) {
+      const auto english=ReadLocalizeValue(result,name);
+      TextHook_RegisterRuntimeEnglishKey(name,english.c_str());
     }
-
-    return originalResult;
+    return result;
   }
 
   return g_Original_DB_FindXAssetHeader(type, name, allowCreateDefault);

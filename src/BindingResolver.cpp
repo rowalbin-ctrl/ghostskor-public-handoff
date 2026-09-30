@@ -1,4 +1,6 @@
 #include "BindingResolver.h"
+#include "NativeGamepad.h"
+#include <unordered_set>
 #include "TextHook.h"
 #include "IW6Offsets.h"
 #include "Utils.h"
@@ -19,61 +21,10 @@ static std::unordered_map<std::string, std::vector<std::string>> g_BindCmdToKeys
 static bool g_BindLoadAttempted = false;
 static std::mutex g_BindMutex;
 
-// ── Gamepad detection via XInput ─────────────────────────────────────
-static bool          g_gpadDetected      = false;
-static unsigned long g_gpadLastCheckTick = 0;
-
-typedef DWORD (WINAPI *XInputGetState_t)(DWORD, void *);
-static XInputGetState_t s_XInputGetState  = nullptr;
-static bool             s_xinputResolved  = false;
-
+// Follow the game's active profile, including keyboard mode with a pad attached.
 static bool IsGamepadActive() {
-  const unsigned long now = GetTickCount();
-  if ((now - g_gpadLastCheckTick) < 500) return g_gpadDetected;
-  g_gpadLastCheckTick = now;
-
-  if (!s_xinputResolved) {
-    s_xinputResolved = true;
-    HMODULE h = LoadLibraryA("xinput1_4.dll");
-    if (!h) h = LoadLibraryA("xinput1_3.dll");
-    if (!h) h = LoadLibraryA("xinput9_1_0.dll");
-    if (h) s_XInputGetState = (XInputGetState_t)GetProcAddress(h, "XInputGetState");
-  }
-
-  if (!s_XInputGetState) { g_gpadDetected = false; return false; }
-
-  // XINPUT_STATE: 16 bytes (dwPacketNumber + XINPUT_GAMEPAD)
-  unsigned char state[16] = {};
-  bool connected = (s_XInputGetState(0, state) == 0); // ERROR_SUCCESS
-  g_gpadDetected = connected;
-  return connected;
-}
-
-// Default Xbox-style gamepad bindings for IW6/Ghosts
-static const std::unordered_map<std::string, std::string> &GetGamepadDefaults() {
-  static const std::unordered_map<std::string, std::string> kPad = {
-      {"+attack", "RT"},
-      {"+speed_throw", "LT"},
-      {"+toggleads_throw", "LT"},
-      {"+activate", "X"},
-      {"+use", "X"},
-      {"+reload", "X"},
-      {"+usereload", "X"},
-      {"+gostand", "A"},
-      {"+jump", "A"},
-      {"+melee_zoom", "RS"},
-      {"+melee", "RS"},
-      {"+frag", "RB"},
-      {"+smoke", "LB"},
-      {"+breath_sprint", "LS"},
-      {"+togglecrouch", "B"},
-      {"+stance", "B"},
-      {"+actionslot1", "D-Pad Up"},
-      {"+actionslot2", "D-Pad Down"},
-      {"+actionslot3", "D-Pad Left"},
-      {"+actionslot4", "D-Pad Right"},
-  };
-  return kPad;
+  bool enabled = false;
+  return NativeGamepad::ReadEnabled(enabled) && enabled;
 }
 
 std::string ExtractKeyFromEnglish(const std::string &english);
@@ -652,6 +603,35 @@ std::string LocalizeBindingDisplayText(const std::string &text,
 }
 
 // IW6 command aliases: game uses different internal names for the same action.
+std::string LocalizeNativeBindingDisplay(const std::string &text) {
+  // Keep the actual controller glyph bytes, without reading another binding.
+  for(unsigned char c:text)if(c>=1 && c<=23 && c!='\t' && c!='\n' && c!='\r')return text;
+  std::vector<std::string> parts;
+  const auto normalized=CollapseSpacesAscii(text);
+  if(!SplitBindingCompositeBy(normalized," OR ",parts) &&
+     !SplitBindingCompositeBy(normalized," KEY_OR ",parts) &&
+     !SplitBindingCompositeBy(normalized," 또는 ",parts))parts={normalized};
+  NormalizeCompositeMouseParts(parts);
+  if(parts.size()>2)return {};
+  for(const auto &part:parts) {
+    auto token=NormalizeBindingTokenUpper(part);
+    if(token.rfind("KEY_",0)==0)token.erase(0,4);
+    const bool single=token.size()==1 && (unsigned char)token[0]>=33 && (unsigned char)token[0]<=126;
+    const bool mouse=token.size()==6 && token.compare(0,5,"MOUSE")==0 && token[5]>='1' && token[5]<='5';
+    const bool function=IsFunctionKeyToken(token) && std::atoi(token.c_str()+1)>=1 && std::atoi(token.c_str()+1)<=24;
+    static const std::unordered_set<std::string> physicalKeys={
+        "SPACE","CTRL","SHIFT","ALT","TAB","ENTER","ESC","INS","DEL",
+        "PGUP","PGDN","HOME","END","MWHEELUP","MWHEELDOWN"};
+    if(single || mouse || function || physicalKeys.count(token))continue;
+    std::string localized,english;
+    // Additional localized key names come from the game's KEY_* resources;
+    // arbitrary one-word prose such as "Kill or Die" is not a key value.
+    if(!TextHook_GetLocalizedKeyText(ToLocalizationKeyName(token),localized,english) ||
+       NormalizeBindingTokenUpper(english)!=token)return {};
+  }
+  return LocalizeBindingDisplayText(normalized,true);
+}
+
 // e.g., +changezoom in localize strings maps to +melee_zoom in keys.cfg.
 static std::string ResolveAlias(const std::string &norm) {
   // Map: localize placeholder command ??actual keys.cfg command
@@ -672,50 +652,38 @@ static std::string ResolveAlias(const std::string &norm) {
   return (it != kAliases.end()) ? it->second : "";
 }
 
-// IW6 Ghosts button control-char mapping (from localize.json LUA_MENU_PAD_*)
-// Returns the control char (1–23) for a given game command, or '\0'.
-static char GetGamepadButtonChar(const std::string &norm) {
-  // Face buttons
-  if (norm == "+gostand"  || norm == "+jump")                 return '\x01'; // A
-  if (norm == "+togglecrouch" || norm == "+stance")           return '\x02'; // B
-  if (norm == "+activate" || norm == "+use" || norm == "+reload" || norm == "+usereload") return '\x03'; // X
-  if (norm == "weapnext"  || norm == "weapprev")              return '\x04'; // Y
-  // Shoulder buttons
-  if (norm == "+smoke")                                        return '\x05'; // LB
-  if (norm == "+frag")                                         return '\x06'; // RB
-  // Start/Back
-  // (14=Start, 15=Back — rarely used in hints; omit for now)
-  // Sticks
-  if (norm == "+breath_sprint")                               return '\x10'; // LS click
-  if (norm == "+melee_zoom" || norm == "+melee")              return '\x11'; // RS click
-  // Triggers
-  if (norm == "+speed_throw" || norm == "+toggleads_throw")   return '\x12'; // LT
-  if (norm == "+attack" || norm == "+attack2")                return '\x13'; // RT
-  // D-Pad
-  if (norm == "+actionslot1")                                  return '\x14'; // D-Up
-  if (norm == "+actionslot2")                                  return '\x15'; // D-Down
-  if (norm == "+actionslot3")                                  return '\x16'; // D-Left
-  if (norm == "+actionslot4")                                  return '\x17'; // D-Right
-  return '\0';
-}
-
 std::string ResolveBindingDisplay(const std::string &command) {
   LoadBindingsIfNeeded();
   std::string norm = NormalizeCmd(command);
   if (norm.empty())
     return "";
 
-  // Gamepad mode: return the native button control char so KoreanRenderer
-  // can render the actual button glyph image inline.
   if (IsGamepadActive()) {
-    char ch = GetGamepadButtonChar(norm);
-    if (ch == '\0') {
-      // Try alias lookup for unmapped commands
-      std::string alias = ResolveAlias(norm);
-      if (!alias.empty()) ch = GetGamepadButtonChar(alias);
+    NativeGamepad::BindingSnapshot snapshot;
+    if (!NativeGamepad::ReadBindings(snapshot)) return "";
+    // Prefer the literal command in the live table, then native compound actions.
+    auto buttons = NativeGamepad::FindButtons(snapshot, norm.c_str());
+    if (!buttons[0]) {
+      const auto canonical = NativeGamepad::CanonicalCommand(norm);
+      buttons = NativeGamepad::FindButtons(snapshot, canonical.c_str());
     }
-    if (ch != '\0')
-      return std::string(1, ch);
+    if (!buttons[0]) {
+      const auto alias = ResolveAlias(norm);
+      if (!alias.empty()) {
+        const auto canonical = NativeGamepad::CanonicalCommand(alias);
+        buttons = NativeGamepad::FindButtons(snapshot, canonical.c_str());
+      }
+    }
+    if (!buttons[0]) return "미지정";
+    // Text's 0x1e/0x1f are engine delimiters; never insert them as raw glyphs.
+    // Standard Ghosts pad layouts use 1..6 and 14..23. Extra keys stay readable.
+    auto display = [](unsigned char key) -> std::string {
+      if (key <= 23) return std::string(1, static_cast<char>(key));
+      return "PAD " + std::to_string(key);
+    };
+    std::string result = display(buttons[0]);
+    if (buttons[1]) result += " 또는 " + display(buttons[1]);
+    return result;
   }
 
   {
@@ -1370,7 +1338,7 @@ std::string ResolveBindingsInText(const std::string &text,
       if (gpad != s_lastState) {
         s_lastState = gpad;
         char buf[64];
-        sprintf_s(buf, "[XINPUT] state → %s  tick=%lu", gpad ? "ON " : "OFF", now);
+        sprintf_s(buf, "[NativeGamepad] state → %s  tick=%lu", gpad ? "ON " : "OFF", now);
         LogToFile(buf);
       }
     }

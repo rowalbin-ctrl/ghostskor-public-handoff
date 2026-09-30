@@ -3,6 +3,11 @@
 #include <string>
 #include <vector>
 
+// True only for unchanged binding-only prompts; the native engine owns them.
+bool TextHook_UsesNativeBindingPrompt(const std::string &keyOrText);
+bool TextHook_UsesNativeHudCaption(const std::string &keyOrText);
+bool TextHook_UsesNativeGameplayText();
+
 // Feature toggles (compile-time)
 #ifndef GHOSTSKOR_NATIVE_SUBTITLE
 #define GHOSTSKOR_NATIVE_SUBTITLE 1
@@ -1143,12 +1148,3 @@ void TextHook_ResetGameTimeDiscovery();  // Invalidate discovered game time, tri
 #endif // GHOSTSKOR_OBJECTIVE_REVERSE
 
 
-
-
-// Soft SLC suspend: disable only the SLC raw hook (for ui_play_credits loading phase)
-void TextHook_SoftSuspendSLC();
-void TextHook_SoftResumeSLC();
-
-// Credits hook suspension: disable/re-enable ALL hooks during credits
-void TextHook_SuspendHooksForCredits();
-void TextHook_ResumeHooksAfterCredits();

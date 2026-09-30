@@ -118,6 +118,7 @@ static int ExtractIntroOrder(const std::string &key) {
 
 // Called by FSHook when INTROSCREEN key is loaded via DB_FindXAssetHeader
 void TextHook_OnIntroKey(const char *key) {
+  if (TextHook_UsesNativeGameplayText()) return;
   if (!key) return;
   EnsureTranslationsLoaded();
 
@@ -241,56 +242,16 @@ IntroOverlaySnapshot TextHook_GetIntroOverlaySnapshot() {
 // IntroTextLayout Detour (0x3F3DE0) - Captures intro/chyron text + layout
 // =============================================================================
 void *Detour_IntroTextLayout(const char *text, void *layoutTable, int flags) {
+  if (TextHook_UsesNativeGameplayText())
+    return Original_IntroTextLayout?Original_IntroTextLayout(text,layoutTable,flags):nullptr;
 
   static uintptr_t s_moduleBase = (uintptr_t)GetModuleHandleA(NULL);
   uintptr_t retAddr = (uintptr_t)_ReturnAddress();
   uintptr_t callerOffset = retAddr - s_moduleBase;
 
-  // --- Soft guard state transition ---
-  // When soft guard is ON (SLC disabled after ui_play_credits), IntroTextLayout
-  // is the arbiter: CREDITS_* key → upgrade to full guard (credits confirmed),
-  // non-CREDITS_* key → cancel soft guard (gameplay confirmed).
-  {
-    extern std::atomic<bool> g_creditsSoftGuard;
-    extern std::atomic<bool> g_creditsGuardActive;
-    if (g_creditsSoftGuard.load(std::memory_order_relaxed)) {
-      if (text && text[0] == 'C' && text[1] == 'R' &&
-          strncmp(text, "CREDITS_", 8) == 0) {
-        // Credits rendering confirmed → upgrade to full guard
-        g_creditsSoftGuard.store(false, std::memory_order_relaxed);
-        g_creditsGuardActive.store(true, std::memory_order_relaxed);
-        TextHook_SuspendHooksForCredits();
-        LogToFile("[CREDITS-GUARD] HARD — CREDITS_* in IntroTextLayout (soft→full)");
-        return Original_IntroTextLayout
-                   ? Original_IntroTextLayout(text, layoutTable, flags)
-                   : nullptr;
-      } else {
-        // Non-credits key → gameplay started, cancel soft guard
-        g_creditsSoftGuard.store(false, std::memory_order_relaxed);
-        TextHook_SoftResumeSLC();
-        LogToFile("[CREDITS-GUARD] SOFT-OFF — non-credits IntroTextLayout key");
-        // fall through to normal processing
-      }
-    }
-  }
-
-  // Credits guard: CREDITS_* keys are only used during the credits screen.
-  // Skip all processing (logging, snapshot, hint/objective capture) to prevent
-  // HUD false positives and per-frame processing flood.
-  // Always call SuspendHooksForCredits() — it's idempotent (checks
-  // g_hooksSuspendedForCredits internally).  This covers the case where
-  // IMPROUDOFYOU1111 set g_creditsGuardActive=true without suspending hooks.
-  if (text && text[0] == 'C' && text[1] == 'R' &&
-      strncmp(text, "CREDITS_", 8) == 0) {
-    extern std::atomic<bool> g_creditsGuardActive;
-    if (!g_creditsGuardActive.load(std::memory_order_relaxed)) {
-      g_creditsGuardActive.store(true, std::memory_order_relaxed);
-    }
-    TextHook_SuspendHooksForCredits();
-    return Original_IntroTextLayout
-               ? Original_IntroTextLayout(text, layoutTable, flags)
-               : nullptr;
-  }
+  // Per-string exclusion only: no hooks or global translation state change.
+  if (TextIntakePolicy::IsUntranslatedCreditsKey(text))
+    return Original_IntroTextLayout ? Original_IntroTextLayout(text, layoutTable, flags) : nullptr;
 
   const int introSlc =
       (g_currentIntroSlcIdx >= 0) ? g_currentIntroSlcIdx : g_lastIntroSlcIdx;
@@ -385,14 +346,16 @@ void *Detour_IntroTextLayout(const char *text, void *layoutTable, int flags) {
   // x/y/alpha/color, so CgDrawCapture and the Korean renderer are unaffected.
   {
     const uintptr_t cgElem =
-        g_CGDrawHudElem_ElemPtr.load(std::memory_order_acquire);
+        NativeHudContext::Get();
     if (cgElem != 0 && text && text[0] != '\0') {
       EnsureTranslationsLoaded();
       std::string keyUpper = ToUpper(std::string(text));
       auto itKr = g_KeyToKorean.find(keyUpper);
       if (itKr != g_KeyToKorean.end() && !itKr->second.empty()) {
         const HudKeyType kt = ClassifyHudKey(keyUpper);
-        if (kt == HUD_KEY_HINT || kt == HUD_KEY_OBJ_HUD_HINT) {
+        if ((kt == HUD_KEY_HINT || kt == HUD_KEY_OBJ_HUD_HINT) &&
+            !TextHook_UsesNativeBindingPrompt(keyUpper) &&
+            !TextHook_UsesNativeHudCaption(keyUpper)) {
           static const char kBlank[] = " ";
           void *blankResult = Original_IntroTextLayout
                                   ? Original_IntroTextLayout(kBlank, layoutTable, flags)
@@ -881,6 +844,7 @@ static bool TryResolveIntroHudScriptCountdown(
       snap.type, snap.x, snap.y, snap.fontScale, snap.timerValue,
       snap.horzAlign, snap.vertAlign);
   const bool allowDirectCountdownTextOnSnap = snapLooksCountdown || fallbackLane;
+  if (!allowDirectCountdownTextOnSnap) return false;
 
   auto tryCandidate = [&](const std::string &rawText,
                           const char *sourceTag) -> bool {
@@ -912,50 +876,8 @@ static bool TryResolveIntroHudScriptCountdown(
     return true;
   }
 
-  const uintptr_t ctx = (uintptr_t)renderCtx;
-  if (ctx > 0x10000 && ctx < 0x7FFFFFFFFFFF) {
-    for (int off = -32; off <= 96; ++off) {
-      const uintptr_t p = ctx + (intptr_t)off;
-      if (!(p > 0x10000 && p < 0x7FFFFFFFFFFF)) {
-        continue;
-      }
-      std::string rawInline;
-      if (TryReadCStringPreview((const char *)p, 160, rawInline) &&
-          tryCandidate(rawInline, "intro_ctx_inline")) {
-        return true;
-      }
-    }
+  (void)renderCtx; // native output is consumed by IntroActualRender
 
-    static const std::array<int, 8> kCtxPtrOffsets = {0x00, 0x08, 0x10, 0x18,
-                                                       0x20, 0x28, 0x30, 0x38};
-    for (int off : kCtxPtrOffsets) {
-      uintptr_t value = 0;
-      if (!TryReadIntroU64(ctx, (uintptr_t)off, value) ||
-          !(value > 0x10000 && value < 0x7FFFFFFFFFFF)) {
-        continue;
-      }
-      std::string rawPtr;
-      if (TryReadCStringPreview((const char *)value, 160, rawPtr) &&
-          tryCandidate(rawPtr, "intro_ctx_ptr")) {
-        return true;
-      }
-    }
-  }
-
-  static const std::array<int, 5> kElemPtrOffsets = {0x40, 0x48, 0x50, 0x58,
-                                                      0x60};
-  for (int off : kElemPtrOffsets) {
-    uintptr_t value = 0;
-    if (!TryReadIntroU64(snap.rbx, (uintptr_t)off, value) ||
-        !(value > 0x10000 && value < 0x7FFFFFFFFFFF)) {
-      continue;
-    }
-    std::string rawPtr;
-    if (TryReadCStringPreview((const char *)value, 160, rawPtr) &&
-        tryCandidate(rawPtr, "intro_elem_ptr")) {
-      return true;
-    }
-  }
   return false;
 }
 
@@ -1535,273 +1457,102 @@ static bool TryResolveObjectiveRenderCtxText(void *renderCtx,
   return true;
 }
 
-static bool TryBuildIntroHudElemSnapshotFromPtr(uintptr_t rbx, int slcIndex,
+// Read the same config table used by the validated native wrapper. No SLC
+// detour, reverse-bias search, string allocation, or per-byte VirtualQuery.
+static std::atomic<const uint32_t*> g_nativeHudConfigTable{nullptr};
+template <size_t Capacity>
+static bool TryReadNativeHudConfigText(uint32_t cfg, char (&text)[Capacity]) {
+  text[0] = 0;
+  if (cfg == 0 || cfg > 0xFFFF || !g_SLC_StringTableGlobal) return false;
+  __try {
+    const uint32_t* configTable = g_nativeHudConfigTable.load(std::memory_order_relaxed);
+    if (!configTable) {
+      const uintptr_t module = (uintptr_t)GetModuleHandleW(nullptr);
+      const auto* wrapper = static_cast<const unsigned char*>(
+          IW6Offsets::GetAddress(module, IW6Offsets::ConfigStringWrapper_SP));
+      const unsigned char head[] = {0x48,0x63,0xC1,0x48,0x8D,0x0D};
+      if (!wrapper || memcmp(wrapper, head, sizeof(head)) != 0) return false;
+      int32_t disp = 0;
+      memcpy(&disp, wrapper + 6, sizeof(disp));
+      configTable = reinterpret_cast<const uint32_t*>(wrapper + 10 + disp);
+      g_nativeHudConfigTable.store(configTable, std::memory_order_relaxed);
+    }
+    const uint32_t slc = configTable[cfg + 0xACu];
+    const uintptr_t table = *(const uintptr_t*)g_SLC_StringTableGlobal;
+    if (!slc || !table) return false;
+    const char* raw = reinterpret_cast<const char*>(table + 4 + ((uintptr_t)slc << 4));
+    for (size_t i=0; i<sizeof(text)-1; ++i) {
+      text[i] = raw[i];
+      if (!text[i]) return i != 0;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {}
+  text[0] = 0;
+  return false;
+}
+
+static bool IsNativeHudConfigRelevant(uint32_t cfg) {
+  char message[1024];
+  // Failure is not a negative cache entry; a reused cfg slot is read afresh.
+  if (!TryReadNativeHudConfigText(cfg, message)) return false;
+  return TextIntakePolicy::ShouldInspectNativeConfig(message) &&
+         !TextHook_UsesNativeBindingPrompt(message) &&
+         !TextHook_UsesNativeHudCaption(message);
+}
+
+static bool TryBuildIntroHudElemSnapshotFromPtr(uintptr_t element, int cfgIndex,
                                                 IntroHudElemSnapshot &outSnap,
                                                 int &outScore,
-                                                std::string *outPreview =
-                                                    nullptr) {
-  outSnap = IntroHudElemSnapshot{};
+                                                std::string *outPreview = nullptr) {
+  outSnap = {};
   outScore = -1;
-
-  if (!(rbx > 0x10000 && rbx < 0x7FFFFFFFFFFF)) {
-    return false;
-  }
-  if (IsBadReadPtr((void *)rbx, 0xA8) != 0) {
-    return false;
-  }
-
-  uint32_t elemType = 0;
-  float elemX = 0.0f;
-  float elemY = 0.0f;
-  float elemFontScale = 0.0f;
-  float elemTimerValue = 0.0f;
-  uint32_t elemHorzAlign = 0;
-  uint32_t elemVertAlign = 0;
-  uint32_t elemColor = 0;
-  uintptr_t elemTextPtr = 0;
-  uint32_t elemLabelSlc = 0;
-  uint32_t elemTextSlc = 0;
-  uint32_t elemTimeU32 = 0;
-  uint32_t elemFxBirthU32 = 0;
-  uint32_t elemFxLetterU32 = 0;
-  uint32_t elemFlagsU32 = 0;
-
-  if (!TryReadIntroU32(rbx, 0x00, elemType) ||
-      !TryReadIntroFloat(rbx, 0x04, elemX) ||
-      !TryReadIntroFloat(rbx, 0x08, elemY) ||
-      !TryReadIntroFloat(rbx, 0x14, elemFontScale) ||
-      !TryReadIntroFloat(rbx, 0x1C, elemTimerValue) ||
-      !TryReadIntroU32(rbx, 0x24, elemHorzAlign) ||
-      !TryReadIntroU32(rbx, 0x28, elemVertAlign) ||
-      !TryReadIntroU32(rbx, 0x30, elemColor) ||
-      !TryReadIntroU64(rbx, 0x50, elemTextPtr) ||
-      !TryReadIntroU32(rbx, 0x78, elemTimeU32) ||
-      !TryReadIntroU32(rbx, 0x80, elemLabelSlc) ||
-      !TryReadIntroU32(rbx, 0x84, elemTextSlc) ||
-      !TryReadIntroU32(rbx, 0x90, elemFxBirthU32) ||
-      !TryReadIntroU32(rbx, 0x94, elemFxLetterU32) ||
-      !TryReadIntroU32(rbx, 0xA4, elemFlagsU32)) {
-    return false;
-  }
-
-  const int elemTime = (int)elemTimeU32;
-  const int elemFxBirthTime = (int)elemFxBirthU32;
-  const int elemFxLetterTime = (int)elemFxLetterU32;
-  const int elemFlags = (int)elemFlagsU32;
-
-  if (!std::isfinite(elemX) || !std::isfinite(elemY) ||
-      !std::isfinite(elemFontScale) || !std::isfinite(elemTimerValue)) {
-    return false;
-  }
-  if (elemType > 0x20 || elemFontScale <= 0.01f || elemFontScale > 6.0f ||
-      elemX < -4096.0f || elemX > 4096.0f || elemY < -4096.0f ||
-      elemY > 4096.0f || elemHorzAlign > 5 || elemVertAlign > 5) {
-    return false;
-  }
-
-  const bool slcMatches = (elemTextSlc == (uint32_t)slcIndex);
-  const bool looksCountdown = LooksLikeIntroCountdownShape(
-      elemType, elemX, elemY, elemFontScale, elemTimerValue, elemHorzAlign,
-      elemVertAlign);
-
-  std::string preview;
-  if (elemTextPtr > 0x10000 && elemTextPtr < 0x7FFFFFFFFFFF) {
-    TryReadCStringPreview((const char *)elemTextPtr, 160, preview);
-  }
-
-  bool previewLooksCountdown = false;
-  HudScriptCountdownMatch previewMatch{};
-  if (!preview.empty() && TryResolveHudScriptCountdownText(preview, previewMatch)) {
-    previewLooksCountdown = true;
-  }
-
-  std::string cfgCountdownKey;
-  const bool cfgLooksCountdown =
-      TryResolveHudScriptCountdownKeyFromCfg(elemTextSlc, cfgCountdownKey) ||
-      TryResolveHudScriptCountdownKeyFromCfg(elemLabelSlc, cfgCountdownKey);
-
-  const std::string previewNorm =
-      ToUpperAscii(TrimSpaces(StripColorCodes(preview)));
-  const bool previewHasClockworkPowerdown =
-      (previewNorm.find("POWERDOWN IN") != std::string::npos);
-
-  int score = 0;
-  if (slcMatches) {
-    score += 120;
-  }
-  if (looksCountdown) {
-    score += 180;
-  }
-  if (previewLooksCountdown) {
-    score += 180;
-  }
-  if (cfgLooksCountdown) {
-    score += 90;
-  }
-  if (previewHasClockworkPowerdown) {
-    score += 220;
-  }
-  if (IsIntroCountdownElemType(elemType)) {
-    score += 16;
-  }
-  if (elemTimerValue > 0.05f && elemTimerValue < 600.0f) {
-    score += 18;
-  }
-  if (elemHorzAlign == 2 && elemVertAlign == 0) {
-    score += 24;
-  }
-
-  const bool acceptable =
-      slcMatches || looksCountdown || previewLooksCountdown ||
-      cfgLooksCountdown || previewHasClockworkPowerdown;
-  if (!acceptable) {
-    return false;
-  }
-
-  outSnap.rbx = rbx;
-  outSnap.type = elemType;
-  outSnap.x = elemX;
-  outSnap.y = elemY;
-  outSnap.fontScale = elemFontScale;
-  outSnap.timerValue = elemTimerValue;
-  outSnap.horzAlign = elemHorzAlign;
-  outSnap.vertAlign = elemVertAlign;
-  outSnap.colorPacked = elemColor;
-  outSnap.textPtr = elemTextPtr;
-  outSnap.elemTime = elemTime;
-  outSnap.fxBirthTime = elemFxBirthTime;
-  outSnap.fxLetterTime = elemFxLetterTime;
-  outSnap.flags = elemFlags;
-  outSnap.labelSlc = elemLabelSlc;
-  outSnap.textSlc = elemTextSlc;
-  outScore = score;
-  if (outPreview) {
-    *outPreview = std::move(preview);
-  }
+  if (outPreview) outPreview->clear();
+  if (element < 0x10000 || element >= 0x7FFFFFFFFFFF) return false;
+  // The pointer is supplied by the current CG_DrawHudElem invocation. Copy
+  // its known POD fields once, preserving SEH for teardown without probing
+  // unrelated stack values. +0x50 is not a string pointer in this build.
+  unsigned char raw[0xA8];
+  __try { memcpy(raw, (const void*)element, sizeof(raw)); }
+  __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+  auto u32 = [&](size_t offset) { uint32_t v; memcpy(&v,raw+offset,4); return v; };
+  auto f32 = [&](size_t offset) { float v; memcpy(&v,raw+offset,4); return v; };
+  outSnap.rbx = element;
+  outSnap.type = u32(0x00);
+  outSnap.x = f32(0x04);
+  outSnap.y = f32(0x08);
+  outSnap.fontScale = f32(0x14);
+  outSnap.timerValue = f32(0x80);
+  // Consumers of this snapshot use 0=left/top, 1=center, 2=right/bottom.
+  const uint32_t screen = u32(0x2C);
+  const auto anchor = [](uint32_t a) { return a == 3 ? 2u : (a == 2 || a == 7 ? 1u : 0u); };
+  outSnap.horzAlign = anchor((screen >> 4) & 15);
+  outSnap.vertAlign = anchor(screen & 15);
+  outSnap.colorPacked = u32(0x30);
+  outSnap.labelSlc = u32(0x40);
+  outSnap.elemTime = (int)u32(0x78);
+  outSnap.textSlc = u32(0x84);
+  outSnap.fxBirthTime = (int)u32(0x90);
+  outSnap.fxLetterTime = (int)u32(0x94);
+  outSnap.flags = (int)u32(0xA4);
+  if (outSnap.type > 0x20 || !std::isfinite(outSnap.x) || !std::isfinite(outSnap.y) ||
+      !std::isfinite(outSnap.fontScale) || outSnap.fontScale <= 0.01f ||
+      outSnap.fontScale > 6.f || outSnap.textSlc != (uint32_t)cfgIndex) return false;
+  outScore = 120;
   return true;
 }
 
-// Keep SEH isolated from C++ objects.
-static bool TryReadIntroHudElemSnapshot(uintptr_t stackBase, int slcIndex,
+static bool TryReadIntroHudElemSnapshot(uintptr_t /*unusedStack*/, int cfgIndex,
                                         IntroHudElemSnapshot &outSnap) {
-  if (!(stackBase > 0x10000 && stackBase < 0x7FFFFFFFFFFF)) {
-    return false;
-  }
-
-  IntroHudElemSnapshot bestSnap{};
-  std::string bestPreview;
-  intptr_t bestSlotOff = 0;
-  int fixedScore = -1;
-  if (TryBuildIntroHudElemSnapshotFromPtr(
-          *(volatile uintptr_t *)(stackBase + 0x78), slcIndex, bestSnap,
-          fixedScore, &bestPreview)) {
-    bestSlotOff = 0x78;
-  }
-
-  int bestScore = fixedScore;
-
-
-  for (intptr_t slotOff = -0x40; slotOff <= 0x180;
-       slotOff += (intptr_t)sizeof(uintptr_t)) {
-    if (slotOff == 0x78) {
-      continue;
-    }
-    const uintptr_t slotAddr = (uintptr_t)((intptr_t)stackBase + slotOff);
-    if (!(slotAddr > 0x10000 && slotAddr < 0x7FFFFFFFFFFF)) {
-      continue;
-    }
-    if (IsBadReadPtr((void *)slotAddr, sizeof(uintptr_t)) != 0) {
-      continue;
-    }
-
-    uintptr_t candPtr = 0;
-    if (!TryReadIntroU64(slotAddr, 0, candPtr)) {
-      continue;
-    }
-
-    IntroHudElemSnapshot candSnap{};
-    std::string candPreview;
-    int candScore = -1;
-    if (!TryBuildIntroHudElemSnapshotFromPtr(candPtr, slcIndex, candSnap,
-                                             candScore, &candPreview)) {
-      continue;
-    }
-
-    const bool candLooksCountdown = LooksLikeIntroCountdownShape(
-        candSnap.type, candSnap.x, candSnap.y, candSnap.fontScale,
-        candSnap.timerValue, candSnap.horzAlign, candSnap.vertAlign);
-    const std::string candPreviewNorm =
-        ToUpperAscii(TrimSpaces(StripColorCodes(candPreview)));
-    const bool candHasClockworkPowerdown =
-        (candPreviewNorm.find("POWERDOWN IN") != std::string::npos);
-    if (candLooksCountdown || candHasClockworkPowerdown) {
-#if GHOSTSKOR_RUNTIME_DIAG
-      static std::unordered_map<uint64_t, DWORD> s_introStackCandLogTick;
-      const DWORD now = GetTickCount();
-      const uint64_t candSig =
-          (((uint64_t)(uint32_t)slcIndex) << 40) ^
-          (((uint64_t)(uint32_t)candSnap.textSlc) << 16) ^
-          ((uint64_t)(uint16_t)(slotOff & 0xFFFF)) ^
-          ((uint64_t)(candHasClockworkPowerdown ? 1u : 0u) << 56);
-      auto itCand = s_introStackCandLogTick.find(candSig);
-      if (itCand == s_introStackCandLogTick.end() ||
-          (now - itCand->second) > 1200) {
-        s_introStackCandLogTick[candSig] = now;
-        char cbuf[768];
-        sprintf_s(
-            cbuf,
-            "[INTRO-TIMER-STACK-CAND] slc=0x%X slot=%+lld score=%d ptr=0x%llX type=%u x=%.1f y=%.1f align=%u/%u fs=%.2f timer=%.3f text=0x%X label=0x%X preview=\"%.120s\"",
-            (unsigned int)slcIndex, (long long)slotOff, candScore,
-            (unsigned long long)candSnap.rbx, candSnap.type, candSnap.x,
-            candSnap.y, candSnap.horzAlign, candSnap.vertAlign,
-            candSnap.fontScale, candSnap.timerValue, candSnap.textSlc,
-            candSnap.labelSlc, Utf8Preview(candPreview, 120).c_str());
-        LogToFile(cbuf);
-      }
-#endif
-    }
-
-    if (candScore > bestScore) {
-      bestScore = candScore;
-      bestSnap = candSnap;
-      bestPreview = std::move(candPreview);
-      bestSlotOff = slotOff;
-    }
-  }
-
-  if (bestScore < 0) {
-    return false;
-  }
-
-  outSnap = bestSnap;
-
-#if GHOSTSKOR_RUNTIME_DIAG
-  static std::unordered_map<uint64_t, DWORD> s_introStackScanLogTick;
-  const DWORD now = GetTickCount();
-  const uint64_t sig =
-      (((uint64_t)(uint32_t)slcIndex) << 32) ^
-      (uint64_t)((uint32_t)bestSnap.textSlc ^ (uint32_t)bestSnap.labelSlc);
-  auto it = s_introStackScanLogTick.find(sig);
-  if (it == s_introStackScanLogTick.end() || (now - it->second) > 1200) {
-    s_introStackScanLogTick[sig] = now;
-    char sbuf[768];
-    sprintf_s(
-        sbuf,
-        "[INTRO-TIMER-STACK] slc=0x%X slot=%+lld score=%d ptr=0x%llX type=%u x=%.1f y=%.1f align=%u/%u fs=%.2f timer=%.3f textPtr=0x%llX preview=\"%.120s\"",
-        (unsigned int)slcIndex, (long long)bestSlotOff, bestScore,
-        (unsigned long long)bestSnap.rbx, bestSnap.type, bestSnap.x, bestSnap.y,
-        bestSnap.horzAlign, bestSnap.vertAlign, bestSnap.fontScale,
-        bestSnap.timerValue, (unsigned long long)bestSnap.textPtr,
-        Utf8Preview(bestPreview, 120).c_str());
-    LogToFile(sbuf);
-  }
-#endif
-
-  return true;
+  int score = 0;
+  return TryBuildIntroHudElemSnapshotFromPtr(NativeHudContext::Get(), cfgIndex,
+                                            outSnap, score);
 }
 
 void Detour_IntroActualRender(int type, void *layoutResult, void *renderCtx,
                               int count) {
+  if (TextHook_UsesNativeGameplayText()) {
+    if (Original_IntroActualRender) Original_IntroActualRender(type,layoutResult,renderCtx,count);
+    return;
+  }
 
   IntroActualRenderProbeHit probeHit;
   IntroActualRenderPrefixOverlay prefixOverlay;
@@ -1901,7 +1652,8 @@ static bool TryBuildIntroDetourSharedContext(uintptr_t stackBase,
                                              int count,
                                              IntroDetourSharedContext &outCtx) {
   outCtx = IntroDetourSharedContext{};
-  if (!TryReadIntroHudElemSnapshot(stackBase, slcIndex, outCtx.snap)) {
+  if (!IsNativeHudConfigRelevant((uint32_t)slcIndex) ||
+      !TryReadIntroHudElemSnapshot(0, slcIndex, outCtx.snap)) {
     return false;
   }
   const uintptr_t moduleBase = (uintptr_t)GetModuleHandleA(NULL);
@@ -2188,71 +1940,33 @@ static void FinalizeIntroCountdownOverlay(int slcIndex,
 }
 
 void Detour_IntroRenderFn(int type, int slcIndex, void *renderCtx, int count) {
-
-  // Credits guard: skip ALL processing (stack scan, CFG-REV, HUDHINT
-  // promotion, objective capture) while credits are active.  Still call
-  // original so the engine renders credits text normally.
-  {
-    extern std::atomic<bool> g_creditsGuardActive;
-    if (g_creditsGuardActive.load(std::memory_order_relaxed)) {
-      g_lastIntroSlcIdx = slcIndex;
-      g_currentIntroSlcIdx = slcIndex;
-      if (Original_IntroRenderFn) {
-        Original_IntroRenderFn(type, slcIndex, renderCtx, count);
-      }
-      g_currentIntroSlcIdx = -1;
-      return;
-    }
+  if (TextHook_UsesNativeGameplayText()) {
+    if (Original_IntroRenderFn) Original_IntroRenderFn(type,slcIndex,renderCtx,count);
+    return;
   }
+  TextPerf::Hit(TextPerf::IntroCalls);
 
   IntroCountdownOverlayState introCountdownState;
 
-  // Per-frame: read native render params from parent's RBX (HudElem struct)
-  // RBX is saved at RSP+78 relative to _AddressOfReturnAddress() (confirmed)
+  // Capture only the object passed to the enclosing native HUD draw.
+  // The old RSP+0x78 assumption was an XMM7 spill in the supported build.
   {
-    uintptr_t stackBase = (uintptr_t)_AddressOfReturnAddress();
+    uintptr_t stackBase = 0; // no stack inspection
     const uintptr_t retAddr = (uintptr_t)_ReturnAddress();
     IntroDetourSharedContext ctx;
     if (TryBuildIntroDetourSharedContext(stackBase, retAddr, type, slcIndex,
                                          renderCtx, count, ctx)) {
+      TextPerf::Hit(TextPerf::IntroSnapshots);
       const IntroHudElemSnapshot &snap = ctx.snap;
       const unsigned int callerOffset = ctx.callerOffset;
 
-      // Credits HudElem pattern detection: during end credits, many
-      // HudElems at y=-120, flags=0x1, fs~1.35 are drawn every frame.
-      // These are credits text lines (weapon models, staff names, etc.).
-      // Skip all expensive processing (CFG-REV, timer stack scan, hint
-      // promotion) to prevent false positives and performance issues.
-      const bool isCreditsHudElem =
-          (snap.y <= -115.0f && snap.flags == 0x1 &&
-           snap.fontScale >= 1.28f && snap.fontScale <= 1.70f);
-      if (isCreditsHudElem) {
-        // Skip expensive processing for credits-like HudElems (performance).
-        // Guard activation is NOT done here — IntroTextLayout CREDITS_* key
-        // detection is the authoritative trigger.  isCreditsHudElem geometry
-        // is too unreliable (false positives during normal gameplay).
-        static DWORD s_lastCreditsPatternLog = 0;
-        const DWORD nowCredits = GetTickCount();
-        if ((nowCredits - s_lastCreditsPatternLog) > 2000) {
-          s_lastCreditsPatternLog = nowCredits;
-          char cbuf[256];
-          sprintf_s(cbuf,
-                    "[CREDITS-PATTERN] y=%.1f fs=%.2f flags=0x%X "
-                    "text=0x%X label=0x%X — skip processing (no guard)",
-                    snap.y, snap.fontScale, snap.flags,
-                    snap.textSlc, snap.labelSlc);
-          LogToFile(cbuf);
-        }
-      }
-
       // Timer-only path. Keep this isolated from the objective/status block so
       // timer work does not have to edit the authority logic below.
-      if (!isCreditsHudElem)
-        ProcessIntroCountdownSnapshot(ctx, introCountdownState);
+      ProcessIntroCountdownSnapshot(ctx, introCountdownState);
 #if GHOSTSKOR_OBJECTIVE_REVERSE
       // Objective/status-only path. This consumes the shared snapshot but
       // should not depend on timer ownership logic above.
-      if (!isCreditsHudElem) {
+      {
 
         // Exact non-objective HUDHINT intake:
         // Some gameplay hints (e.g. DEER_HUNT_LASER_HINT) surface through the
@@ -2745,9 +2459,9 @@ void Detour_IntroRenderFn(int type, int slcIndex, void *renderCtx, int count) {
           }
           // OSREV draw sample feed removed — OSAUTH is the sole authority.
         }
-      } // !isCreditsHudElem (GHOSTSKOR_OBJECTIVE_REVERSE block)
+      } // objective/status block
 #endif
-      if (!isCreditsHudElem) {
+      {
         if (RuntimeFlags_ObjectiveStatusEnableOsRevOnly()) {
           static bool s_loggedOsRevSlcDisabled = false;
           if (!s_loggedOsRevSlcDisabled) {
@@ -3154,7 +2868,7 @@ void Detour_IntroRenderFn(int type, int slcIndex, void *renderCtx, int count) {
             }
           }
         }
-      } // !isCreditsHudElem (NativeIntroRenderState block)
+      } // native intro state
       }
     }
 

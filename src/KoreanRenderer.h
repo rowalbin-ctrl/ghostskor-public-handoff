@@ -1,5 +1,8 @@
 #pragma once
 #include "Utils.h"
+#include "MenuClip.h"
+#include "NativeTextLayout.h"
+#include "NativeGlyphBridge.h"
 #include <cstdint>
 #include <d3d11.h>
 #include <mutex>
@@ -21,6 +24,9 @@ struct DrawCommand {
   int forceAlign;         // -1 auto, 0 left, 1 right, 2 center
   float maxWidthPx;       // <=0 uses renderer default
   bool skipMenuClipping;  // bypass menu clipping heuristics for this command
+  bool nativeMenu = false; // captured inside a complete engine UI frame
+  MenuClipRect menuClip;
+  NativeTextLayout nativeText;
 
   // Subtitle-only: allow overriding certain IW color codes with engine-driven
   // UI colors (avoids neon primary colors while keeping ^-markup).
@@ -98,6 +104,8 @@ struct DrawStylePatch {
 
 class KoreanRenderer {
 public:
+  static void BeginMenuFrame();
+  static void EndMenuFrame();
   // Core
   static ID3D11Device *s_pDevice;
   static ID3D11DeviceContext *s_pContext;
@@ -166,8 +174,11 @@ public:
   static void SetLastCommandColorCode2Override(float r, float g, float b);
 
   static void Render();
+  static void RenderNativeBatch(const std::vector<DrawCommand> &batch);
+  static void RenderNativeGlyphQuads(const std::vector<NativeGlyphQuad> &quads);
 
 private:
+  static void RenderCommands(const std::vector<DrawCommand> *nativeBatch);
   static void CreateShaders();
   static void CreateBuffers();
   static void CreateStates();
@@ -187,4 +198,3 @@ void KoreanRenderer_LatchRorkeReferenceHeaderLayout(float x, float y,
 void KoreanRenderer_LatchRorkeDetailBodyLayout(int pageId, float x, float y,
                                                float fontHeight,
                                                float scale);
-

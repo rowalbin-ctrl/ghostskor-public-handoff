@@ -723,6 +723,21 @@ bool TextHook_GetLocalizedKeyText(const std::string &key,
   return true;
 }
 
+bool TextHook_UsesNativeBindingPrompt(const std::string &keyOrText) {
+  if (NativeBindingPrompt::IsBindingOnly(keyOrText)) return true;
+  EnsureTranslationsLoaded();
+  // Config messages can prefix their single localization key with 0x1E.
+  size_t first = 0;
+  while (first < keyOrText.size() &&
+         (keyOrText[first] == '\x1e' || keyOrText[first] == '@')) ++first;
+  const std::string key = ToUpperAscii(keyOrText.substr(first));
+  const auto &english = TranslationStore::KeyToEnglish();
+  const auto &korean = TranslationStore::KeyToKorean();
+  const auto en = english.find(key), kr = korean.find(key);
+  return en != english.end() && kr != korean.end() &&
+         NativeBindingPrompt::IsUnchanged(en->second, kr->second);
+}
+
 // Load Translations from JSON
 
 static void LoadTranslations() {

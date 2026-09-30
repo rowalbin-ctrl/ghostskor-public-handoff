@@ -1,3 +1,4 @@
+#include "TextPerf.h"
 #include "GameBuild.h"
 #include "DXGIWrapper.h"
 #include "D3D11Hook.h"
@@ -8,6 +9,7 @@
 #include "Utils.h"
 #include <atomic>
 #include <cstdio>
+#include <new>
 
 // Forward declare helper from D3D11Hook.cpp
 
@@ -19,6 +21,19 @@ GameActiveArea g_ActiveArea = {0.0f, 0.0f, 0.0f, 0.0f};
 
 namespace {
 std::atomic<ULONG> g_LiveWrappedSwapChains{0};
+const GUID kFactoryWrapperTag = {0x424d0bfa, 0x1565, 0x4e0e, {0x97,0x1c,0xc2,0x03,0xaf,0xba,0xed,0x11}};
+const GUID kSwapChainWrapperTag = {0x5b66c6fa, 0x579c, 0x4943, {0xb3,0x6c,0xcf,0xab,0xaf,0xfa,0xb9,0x01}};
+
+IDXGISwapChain *WrapSwapChain(IDXGISwapChain *real) {
+  if (!real) return nullptr;
+  IDXGISwapChain *existing = nullptr;
+  if (SUCCEEDED(real->QueryInterface(kSwapChainWrapperTag, (void**)&existing)))
+    return existing;
+  auto *wrapped = new (std::nothrow) WrappedIDXGISwapChain(real);
+  if (wrapped) return wrapped;
+  real->AddRef();
+  return real;
+}
 
 bool IsSwapChainWrapperInterface(REFIID riid) {
   return riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) ||
@@ -78,7 +93,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain::QueryInterface(REFIID riid,
   }
   *ppvObj = nullptr;
 
-  if (IsSwapChainWrapperInterface(riid)) {
+  if (riid == kSwapChainWrapperTag || IsSwapChainWrapperInterface(riid)) {
     *ppvObj = static_cast<IDXGISwapChain *>(this);
     AddRef();
     return S_OK;
@@ -149,6 +164,7 @@ bool WrappedIDXGISwapChain::EnsureBackBufferRTV() {
 // Ensure Render Init happens once lazily
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain::Present(UINT SyncInterval,
                                                          UINT Flags) {
+  TextPerf::Frame();
   if (!GameBuild::RuntimeReady()) return m_pReal->Present(SyncInterval, Flags);
   if (!m_pDevice) {
     if (SUCCEEDED(
@@ -231,14 +247,14 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain::GetParent(REFIID riid,
   *ppParent = nullptr;
 
   if (IsFactoryWrapperInterface(riid)) {
-    IDXGIFactory1 *pFactory = nullptr;
+    IDXGIFactory *pFactory = nullptr;
     const HRESULT hr =
-        m_pReal->GetParent(__uuidof(IDXGIFactory1), (void **)&pFactory);
+        m_pReal->GetParent(__uuidof(IDXGIFactory), (void **)&pFactory);
     if (FAILED(hr) || !pFactory) {
       return hr;
     }
 
-    WrappedIDXGIFactory *wrapper = new WrappedIDXGIFactory(pFactory);
+    auto *wrapper = (IDXGIFactory1*)WrapFactory(pFactory);
     pFactory->Release();
 
     const HRESULT qiHr = wrapper->QueryInterface(riid, ppParent);
@@ -324,12 +340,15 @@ WrappedIDXGISwapChain::GetLastPresentCount(UINT *pLastPresentCount) {
 // WrappedIDXGIFactory
 // =============================================================
 
-WrappedIDXGIFactory::WrappedIDXGIFactory(IDXGIFactory1 *pReal)
-    : m_pReal(pReal), m_refCount(1) {
-  if (m_pReal)
+WrappedIDXGIFactory::WrappedIDXGIFactory(IDXGIFactory *pReal)
+    : m_pReal(pReal), m_pReal1(nullptr), m_refCount(1) {
+  if (m_pReal) {
     m_pReal->AddRef();
+    m_pReal->QueryInterface(__uuidof(IDXGIFactory1), (void**)&m_pReal1);
+  }
 }
 WrappedIDXGIFactory::~WrappedIDXGIFactory() {
+  if (m_pReal1) m_pReal1->Release();
   if (m_pReal)
     m_pReal->Release();
 }
@@ -341,7 +360,8 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGIFactory::QueryInterface(REFIID riid,
   }
   *ppvObj = nullptr;
 
-  if (IsFactoryWrapperInterface(riid)) {
+  if (riid == __uuidof(IDXGIFactory1) && !m_pReal1) return E_NOINTERFACE;
+  if (riid == kFactoryWrapperTag || IsFactoryWrapperInterface(riid)) {
     *ppvObj = static_cast<IDXGIFactory1 *>(this);
     AddRef();
     return S_OK;
@@ -364,12 +384,14 @@ ULONG STDMETHODCALLTYPE WrappedIDXGIFactory::Release() {
 HRESULT STDMETHODCALLTYPE WrappedIDXGIFactory::CreateSwapChain(
     IUnknown *pDevice, DXGI_SWAP_CHAIN_DESC *pDesc,
     IDXGISwapChain **ppSwapChain) {
+  if (!ppSwapChain) return E_POINTER;
+  *ppSwapChain = nullptr;
   IDXGISwapChain *pRealChain = nullptr;
   HRESULT hr = m_pReal->CreateSwapChain(pDevice, pDesc, &pRealChain);
 
   if (SUCCEEDED(hr) && pRealChain) {
     // WRAP IT
-    *ppSwapChain = new WrappedIDXGISwapChain(pRealChain);
+    *ppSwapChain = WrapSwapChain(pRealChain);
     // Release real one since wrapper holds ref
     pRealChain->Release();
   } else {
@@ -415,14 +437,22 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGIFactory::CreateSoftwareAdapter(
 
 HRESULT STDMETHODCALLTYPE
 WrappedIDXGIFactory::EnumAdapters1(UINT Adapter, IDXGIAdapter1 **ppAdapter) {
-  return m_pReal->EnumAdapters1(Adapter, ppAdapter);
+  if (!m_pReal1) { if (ppAdapter) *ppAdapter = nullptr; return E_NOINTERFACE; }
+  return m_pReal1->EnumAdapters1(Adapter, ppAdapter);
 }
 BOOL STDMETHODCALLTYPE WrappedIDXGIFactory::IsCurrent() {
-  return m_pReal->IsCurrent();
+  return m_pReal1 ? m_pReal1->IsCurrent() : FALSE;
 }
 
 extern "C" void *WrapFactory(void *pReal) {
   if (!pReal)
     return nullptr;
-  return new WrappedIDXGIFactory((IDXGIFactory1 *)pReal);
+  auto *real = (IDXGIFactory*)pReal;
+  IDXGIFactory1 *existing = nullptr;
+  if (SUCCEEDED(real->QueryInterface(kFactoryWrapperTag, (void**)&existing)))
+    return existing;
+  auto *wrapped = new (std::nothrow) WrappedIDXGIFactory(real);
+  if (wrapped) return wrapped;
+  real->AddRef();
+  return real;
 }

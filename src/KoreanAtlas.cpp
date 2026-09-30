@@ -2,6 +2,8 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 namespace KoreanAtlas {
 
@@ -9,7 +11,40 @@ namespace {
 std::unordered_map<uint32_t, GlyphInfo> g_metricsSlots[kAtlasSlotCount];
 int g_atlasWidthSlots[kAtlasSlotCount] = {4096, 4096};
 int g_atlasHeightSlots[kAtlasSlotCount] = {4096, 4096};
+struct InkBounds { bool valid = false; float top = 0, bottom = 0; };
+InkBounds g_hangulBounds[kAtlasSlotCount];
+void UpdateHangulBounds(uint8_t slot) {
+  InkBounds bounds;
+  for (const auto &entry : g_metricsSlots[slot]) {
+    if (entry.first < 0xAC00 || entry.first > 0xD7A3) continue;
+    const auto &glyph = entry.second;
+    const float top = -static_cast<float>(glyph.yOffset);
+    const float bottom = top + std::round((glyph.v1 - glyph.v0) *
+        static_cast<float>(g_atlasHeightSlots[slot]) / 65535.0f);
+    if (!bounds.valid) bounds = {true, top, bottom};
+    else {
+      bounds.top = (std::min)(bounds.top, top);
+      bounds.bottom = (std::max)(bounds.bottom, bottom);
+    }
+  }
+  g_hangulBounds[slot] = bounds;
+}
 } // namespace
+
+bool GetHangulBounds(uint8_t slot, float &top, float &bottom) {
+  if (slot >= kAtlasSlotCount || !g_hangulBounds[slot].valid) return false;
+  top = g_hangulBounds[slot].top; bottom = g_hangulBounds[slot].bottom;
+  return bottom > top;
+}
+
+bool GetCapBounds(uint8_t slot, float &top, float &bottom) {
+  const auto glyph = GetGlyph('H', slot);
+  if (!glyph) return false;
+  top = -static_cast<float>(glyph->yOffset);
+  bottom = top + std::round((glyph->v1 - glyph->v0) *
+      static_cast<float>(GetAtlasHeight(slot)) / 65535.0f);
+  return bottom > top;
+}
 
 bool LoadMetrics(const std::string &filename, uint8_t slot) {
   if (slot >= kAtlasSlotCount) {
@@ -75,6 +110,7 @@ bool LoadMetrics(const std::string &filename, uint8_t slot) {
     metrics[pm.codepoint] = info;
   }
 
+  UpdateHangulBounds(slot);
   std::cout << "[KoreanAtlas] Loaded " << count << " glyph metrics (slot "
             << (int)slot << ")." << std::endl;
   return true;
@@ -140,6 +176,7 @@ bool LoadMetricsFromMemory(const void *data, size_t dataSize, uint8_t slot) {
     metrics[pm.codepoint] = info;
   }
 
+  UpdateHangulBounds(slot);
   std::cout << "[KoreanAtlas] Loaded " << count
             << " glyph metrics from embedded resource (slot " << (int)slot
             << ")." << std::endl;

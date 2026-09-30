@@ -231,72 +231,6 @@ void D3D11Hook::Cleanup() {
   g_pBackBuffer = nullptr;
 }
 
-// =========================================================================
-// DXGI Factory Hooking (Robust SwapChain Capture)
-// =========================================================================
-
-typedef HRESULT(WINAPI *CreateDXGIFactory_t)(REFIID riid, void **ppFactory);
-typedef HRESULT(WINAPI *CreateDXGIFactory1_t)(REFIID riid, void **ppFactory);
-
-CreateDXGIFactory_t Original_CreateDXGIFactory = nullptr;
-CreateDXGIFactory1_t Original_CreateDXGIFactory1 = nullptr;
-
-HRESULT WINAPI Hook_CreateDXGIFactory(REFIID riid, void **ppFactory) {
-  LogToFile("[D3D11Hook] Intercepted CreateDXGIFactory!");
-  HRESULT hr = Original_CreateDXGIFactory(riid, ppFactory);
-
-  if (SUCCEEDED(hr) && ppFactory && *ppFactory) {
-    LogToFile("[D3D11Hook] Wrapping DXGI Factory...");
-    *ppFactory = new WrappedIDXGIFactory((IDXGIFactory1 *)*ppFactory);
-  }
-  return hr;
-}
-
-HRESULT WINAPI Hook_CreateDXGIFactory1(REFIID riid, void **ppFactory) {
-  LogToFile("[D3D11Hook] Intercepted CreateDXGIFactory1!");
-  HRESULT hr = Original_CreateDXGIFactory1(riid, ppFactory);
-
-  if (SUCCEEDED(hr) && ppFactory && *ppFactory) {
-    LogToFile("[D3D11Hook] Wrapping DXGI Factory1...");
-    *ppFactory = new WrappedIDXGIFactory((IDXGIFactory1 *)*ppFactory);
-  }
-  return hr;
-}
-
-void D3D11Hook::InitDXGI() {
-  LogToFile("[D3D11Hook] Initializing DXGI Factory Hooks (IAT)...");
-
-  HMODULE hMod = GetModuleHandle(NULL); // Hook Main Module Imports
-  if (!hMod)
-    return;
-
-  // We need the REAL dxgi.dll loaded
-  HMODULE hDXGI = LoadLibrary("dxgi.dll");
-  if (!hDXGI) {
-    LogToFile("[D3D11Hook] ERROR: Could not load system dxgi.dll");
-    return;
-  }
-
-  Original_CreateDXGIFactory =
-      (CreateDXGIFactory_t)GetProcAddress(hDXGI, "CreateDXGIFactory");
-  Original_CreateDXGIFactory1 =
-      (CreateDXGIFactory1_t)GetProcAddress(hDXGI, "CreateDXGIFactory1");
-
-  if (Original_CreateDXGIFactory) {
-    if (IATHook(hMod, "dxgi.dll", "CreateDXGIFactory",
-                (void *)Hook_CreateDXGIFactory, NULL)) {
-      LogToFile("[D3D11Hook] SUCCESS: IAT Hooked CreateDXGIFactory");
-    }
-  }
-
-  if (Original_CreateDXGIFactory1) {
-    if (IATHook(hMod, "dxgi.dll", "CreateDXGIFactory1",
-                (void *)Hook_CreateDXGIFactory1, NULL)) {
-      LogToFile("[D3D11Hook] SUCCESS: IAT Hooked CreateDXGIFactory1");
-    }
-  }
-}
-
 // Phase 5: GateState unified visibility gate for all pipelines
 // RULES:
 //   Gate is applied as final render alpha ONLY.
@@ -399,21 +333,19 @@ static GateState ComputeGateState(DWORD now, DWORD suppressUntil) {
 // transitionBlack is the single gate authority for video/loading suppression.
 static float ObjectiveVisibility(const GateState &g) {
   if (g.pauseMenu || g.frontMenu || g.transitionBlack || g.warmupActive ||
-      g.creditsActive || !g.signals.hudShowObjectives)
+      !g.signals.hudShowObjectives)
     return 0.0f;
   return 1.0f;
 }
 
 static float HintVisibility(const GateState &g) {
-  if (g.pauseMenu || g.frontMenu || g.transitionBlack || g.warmupActive ||
-      g.creditsActive)
+  if (g.pauseMenu || g.frontMenu || g.transitionBlack || g.warmupActive)
     return 0.0f;
   return 1.0f;
 }
 
 static float ObjHudHintVisibility(const GateState &g) {
-  if (g.pauseMenu || g.frontMenu || g.transitionBlack || g.warmupActive ||
-      g.creditsActive)
+  if (g.pauseMenu || g.frontMenu || g.transitionBlack || g.warmupActive)
     return 0.0f;
   return 1.0f;
 }

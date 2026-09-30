@@ -8,7 +8,7 @@
 
     const bool objHudHintOverlayVisible =
         (!objHudHintEntries.empty() && !suppressHudOverlay && !gate.pauseMenu &&
-         !gate.warmupActive && !gate.creditsActive &&
+         !gate.warmupActive &&
          overlaySessionState != OVERLAY_SESSION_WARMUP &&
          !objhhRestartSuppressed && !objhhPostVideoSuppressed);
     if (objHudHintOverlayVisible) {

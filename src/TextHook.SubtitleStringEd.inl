@@ -1,3 +1,4 @@
+#include "NativeSubtitleQueue.h"
 uintptr_t __fastcall Detour_SubtitleWrap2351E0(int a1, const char *key, int a3,
                                                int a4) {
   // Provide per-thread context for downstream +0x235620 hook.
@@ -58,14 +59,32 @@ uintptr_t __fastcall Detour_SubtitleWrap2351E0(int a1, const char *key, int a3,
 uintptr_t __fastcall Detour_SubtitleEnqueue235620(int a1, int windowId,
                                                   const char *localizedText,
                                                   int a3, int a4, int a6) {
-  // Pass blank text to engine so English subtitle is hidden.
-  // Our Korean overlay uses localizedText (unchanged) for translation.
-  static const char kBlankSubtitle[] = " ";
-  uintptr_t ret = 0;
-  if (Original_SubtitleEnqueue235620) {
-    ret = Original_SubtitleEnqueue235620(a1, windowId, kBlankSubtitle, a3, a4,
-                                         a6);
+  // 273EA0 uses window 4 for dialogue. 233AA0/233C90 call this same
+  // enqueue function with windows 3/2 for other native messages. Those must
+  // retain their text and lifetime; they are translated at their real draw.
+  if (windowId != 4) {
+    return Original_SubtitleEnqueue235620
+        ? Original_SubtitleEnqueue235620(a1,windowId,localizedText,a3,a4,a6) : 0;
   }
+  // Resolve content first. Only a real, translated dialogue event may hide
+  // the English command; unknown text remains available in the native engine.
+  const auto &enqueueContext = g_SubWrapCallCtx;
+  std::string resolvedKey;
+  if (enqueueContext.active &&
+      (enqueueContext.key.rfind("SUBTITLE_",0)==0 ||
+       enqueueContext.key.rfind("VIDSUBTITLES_",0)==0)) {
+    resolvedKey=enqueueContext.key;
+  } else if (localizedText && *localizedText) {
+    ResolveSubtitleKeyFromLocalizedText(localizedText,resolvedKey);
+  }
+  resolvedKey=ToUpper(resolvedKey);
+  const auto translation=g_KeyToKorean.find(resolvedKey);
+  const bool replace=translation!=g_KeyToKorean.end() && !translation->second.empty() &&
+                     KoreanRenderer::s_bInitialized;
+  static const char kBlankSubtitle[] = " ";
+  const uintptr_t ret=Original_SubtitleEnqueue235620
+      ? Original_SubtitleEnqueue235620(a1,windowId,replace?kBlankSubtitle:localizedText,a3,a4,a6) : 0;
+  if(!replace)return ret;
 
   uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
   uintptr_t caller = (uintptr_t)_ReturnAddress();
@@ -137,13 +156,6 @@ uintptr_t __fastcall Detour_SubtitleEnqueue235620(int a1, int windowId,
                         (strstr(localizedText, ": ") != nullptr);
   }
 
-  std::string resolvedKey;
-  if (ctxSubtitle && !ctx.key.empty()) {
-    resolvedKey = ctx.key;
-  } else if (localizedText && localizedText[0]) {
-    ResolveSubtitleKeyFromLocalizedText(localizedText, resolvedKey);
-  }
-
   bool likelySubtitle =
       fromSubWrap || ctxSubtitle || textLooksSubtitle ||
       !resolvedKey.empty() || (windowId == 4 && localizedText && localizedText[0]);
@@ -182,121 +194,21 @@ uintptr_t __fastcall Detour_SubtitleEnqueue235620(int a1, int windowId,
   if (enqueueKey.empty() && ctxSubtitle && !ctx.key.empty()) {
     enqueueKey = ctx.key;
   }
-  if (!enqueueKey.empty()) {
-    SubtitleReverse_OnEnqueueInstance(enqueueKey, localizedText, a3, a4,
-                                      TextHook_GetSubtitleClockNow());
-  }
 
-  // Credits guard: activate when Hesh's "I'm proud of you" line fires,
-  // which precedes the credits sequence.  This suppresses all HUD hint /
-  // objective detection pipelines during credits (not just rendering).
-  //
-  // False-positive guard (Method 1+2): During map init the engine prefetches
-  // ALL subtitle keys for the level via SEH_StringEd_GetString before gameplay
-  // begins. Block the guard unless at least 30 seconds OR 1800 frames have
-  // elapsed since the last Bink video closed (the map load video).
-  // If no video has ever closed in this session, allow unconditionally.
-  if (!enqueueKey.empty() &&
-      enqueueKey == "SUBTITLE_SKYWAY_HSH_IMPROUDOFYOU1111") {
-    extern std::atomic<bool>     g_creditsGuardActive;
-    extern std::atomic<DWORD>    g_lastBinkVideoCloseTick;
-    extern std::atomic<uint64_t> g_presentFrameCount;
-    extern std::atomic<uint64_t> g_presentFrameAtLastVideoClose;
-    if (!g_creditsGuardActive.load(std::memory_order_relaxed)) {
-      const DWORD lastClose = g_lastBinkVideoCloseTick.load(std::memory_order_relaxed);
-      const bool  noVideoYet = (lastClose == 0);
-      const DWORD elapsedMs  = noVideoYet ? 0xFFFFFFFFu : (GetTickCount() - lastClose);
-      const uint64_t framesSinceClose =
-          g_presentFrameCount.load(std::memory_order_relaxed) -
-          g_presentFrameAtLastVideoClose.load(std::memory_order_relaxed);
-      // Allow if no video yet, OR 30s elapsed, OR 1800 frames elapsed.
-      const bool pastLoading = noVideoYet || (elapsedMs >= 30000u) || (framesSinceClose >= 1800u);
-      if (pastLoading) {
-        g_creditsGuardActive.store(true, std::memory_order_relaxed);
-        LogToFile("[CREDITS-GUARD] ON — pre-credits subtitle detected "
-                  "(IMPROUDOFYOU1111)");
-        // NOTE: intentionally NOT calling TextHook_SuspendHooksForCredits() here.
-        // Suspending the SEH hook would block dialogue subtitles that follow
-        // this line in the same scene.  The guard flag alone is enough:
-        // - SLC hook checks guard → immediate return (no CPU overhead)
-        // - HudElem scan checks guard → immediate return
-        // Only the menu-credits path (ui_play_credits SLC) needs full suspension.
-      } else {
-        char skipbuf[128];
-        sprintf_s(skipbuf,
-                  "[CREDITS-GUARD] SKIP — prefetch burst (elapsed=%ums frames=%llu)",
-                  elapsedMs, (unsigned long long)framesSinceClose);
-        LogToFile(skipbuf);
-      }
-    }
+  // This native event owns queue creation and its exact duration. SEH asset
+  // lookups only register translation content and cannot manufacture events.
+  const DWORD eventNow=TextHook_GetSubtitleClockNow();
+  {
+    std::lock_guard<std::mutex> queueLock(g_InGameSubtitleMutex);
+    NativeSubtitleQueue::Enqueue(g_InGameSubtitleQueue,windowId,resolvedKey,
+        localizedText?localizedText:"",translation->second,eventNow,a3,a4,a6,MAX_SUBTITLE_QUEUE);
+    g_InGameSubtitle.korean=translation->second;
+    g_InGameSubtitle.timestamp=eventNow;
   }
-
-  // === SUBTITLE RE-INJECTION (Engine-pipeline backup capture) ===
-  // When the engine enqueues a subtitle (e.g., after checkpoint restore or
-  // death/respawn), check if our Korean overlay queue already has it.
-  // If not, re-inject from the translation store.
-  if (windowId == 4 && !enqueueKey.empty() &&
-      (enqueueKey.rfind("SUBTITLE_", 0) == 0 ||
-       enqueueKey.rfind("VIDSUBTITLES_", 0) == 0)) {
-    std::string keyUpper = ToUpper(enqueueKey);
-    auto itKor = g_KeyToKorean.find(keyUpper);
-    if (itKor != g_KeyToKorean.end() && !itKor->second.empty()) {
-      DWORD reinjectClockNow = TextHook_GetSubtitleClockNow();
-      std::lock_guard<std::mutex> queueLock(g_InGameSubtitleMutex);
-      auto qIt = std::find_if(
-          g_InGameSubtitleQueue.begin(), g_InGameSubtitleQueue.end(),
-          [&](const InGameSubtitleEntry &e) { return e.key == enqueueKey; });
-      if (qIt == g_InGameSubtitleQueue.end()) {
-        // Subtitle not in our queue — re-inject from Korean store.
-        for (auto &ex : g_InGameSubtitleQueue) {
-          int slot = ex.renderSlot;
-          if (slot < 0 || slot >= (int)MAX_SUBTITLE_QUEUE) {
-            slot = ex.stackIndex;
-            if (slot < 0) slot = 0;
-            if (slot >= (int)MAX_SUBTITLE_QUEUE)
-              slot = (int)MAX_SUBTITLE_QUEUE - 1;
-          }
-          if (slot < (int)MAX_SUBTITLE_QUEUE - 1) slot++;
-          ex.renderSlot = slot;
-        }
-        for (auto &existing : g_InGameSubtitleQueue) {
-          if (existing.pushAnimStart == 0)
-            existing.pushAnimStart = reinjectClockNow;
-          existing.stackIndex = existing.renderSlot;
-        }
-        InGameSubtitleEntry newEntry;
-        newEntry.text = itKor->second;
-        newEntry.timestamp = reinjectClockNow;
-        newEntry.firstSeen = reinjectClockNow;
-        newEntry.key = enqueueKey;
-        newEntry.english = localizedText ? std::string(localizedText) : "";
-        newEntry.stackIndex = 0;
-        newEntry.pushAnimStart = 0;
-        newEntry.renderSlot = 0;
-        newEntry.msgTimeMs = a3;
-        newEntry.fadeOutMs = a4;
-        newEntry.runtimeArg6 = a6;
-        newEntry.runtimeTick = reinjectClockNow;
-        newEntry.nativeSlotPtr = 0;
-        newEntry.nativeSlotValid = false;
-        newEntry.nativeRemoveTick = 0;
-        newEntry.nativeRemoveValid = false;
-        newEntry.nativeRemoveReason = SUBREV_REMOVE_NONE;
-        g_InGameSubtitleQueue.insert(g_InGameSubtitleQueue.begin(), newEntry);
-        if (g_InGameSubtitleQueue.size() > MAX_SUBTITLE_QUEUE)
-          g_InGameSubtitleQueue.resize(MAX_SUBTITLE_QUEUE);
-        static int reinjectLogCount = 0;
-        if (reinjectLogCount < 100) {
-          reinjectLogCount++;
-          char rbuf[256];
-          sprintf_s(rbuf,
-                    "[SUBENQ-REINJECT] key=%s msg=%d fade=%d queueSize=%zu",
-                    enqueueKey.c_str(), a3, a4, g_InGameSubtitleQueue.size());
-          LogToFile(rbuf);
-        }
-      }
-    }
-  }
+  g_LastSubtitleActivityTime.store(GetTickCount());
+  SubtitleReverse_OnEnqueueInstance(enqueueKey,localizedText,a3,a4,eventNow);
+  NativeMenuCapture::TraceSource(11,localizedText,translation->second.c_str(),
+                                 resolvedKey.c_str(),a3,(float)eventNow,(float)a4);
 
   static std::atomic<int> s_logCount{0};
   int c = s_logCount.fetch_add(1);
@@ -2378,15 +2290,6 @@ static void PruneInGameSubtitleQueueLocked(DWORD now) {
 std::string TextHook_GetInGameSubtitle() {
   std::lock_guard<std::mutex> lock(g_InGameSubtitleMutex);
 
-  static DWORD s_startTime = GetTickCount();
-  DWORD now = GetTickCount();
-
-  // FIX: Detect "Brief Black Screen" subtitle bug
-  // Suppress subtitles for the first 15 seconds of process lifetime
-  if (now - s_startTime < 15000) {
-    return "";
-  }
-
   // Clear subtitle after 6 seconds of in-game subtitle clock inactivity
   DWORD subtitleNow = TextHook_GetSubtitleClockNow();
   if (g_InGameSubtitle.timestamp > 0 &&
@@ -2965,34 +2868,10 @@ const char *__fastcall Detour_SEH_StringEd_GetString(const char *reference) {
   if (!reference)
     return original;
 
-  // CREDITS_ key fast path: no Korean translation exists for credits text and
-  // any CREDITS_ key is a reliable signal that the credits screen is active.
-  // Activate the guard immediately and return — bypasses all logging and
-  // expensive lookups (fixing both the HUD false-positive and the per-frame
-  // processing flood during credits).
-  if (reference[0] == 'C' && reference[1] == 'R' &&
-      strncmp(reference, "CREDITS_", 8) == 0) {
-    extern std::atomic<bool> g_creditsGuardActive;
-    if (!g_creditsGuardActive.load(std::memory_order_relaxed)) {
-      g_creditsGuardActive.store(true, std::memory_order_relaxed);
-      LogToFile("[CREDITS-GUARD] ON — CREDITS_ key detected in SEH hook");
-    }
-    return original;
-  }
-
-  // Credits guard: allow SUBTITLE_* keys through for Korean dialogue display.
-  // All other keys (CREDITS_*, HUD keys, etc.) get an early return to avoid
-  // the processing overhead of the 300K+/frame credits string flood.
-  // We do NOT call TextHook_SuspendHooksForCredits() from the subtitle-triggered
-  // guard path so that subsequent dialogue subtitles still reach this hook.
-  {
-    extern std::atomic<bool> g_creditsGuardActive;
-    if (g_creditsGuardActive.load(std::memory_order_relaxed)) {
-      if (strncmp(reference, "SUBTITLE_", 9) != 0) {
-        return original;
-      }
-    }
-  }
+  // This payload has no Korean translation; other text remains active.
+  if (TextIntakePolicy::IsUntranslatedCreditsKey(reference)) return original;
+  // Identical button-only strings need neither translation nor an overlay.
+  if (TextHook_UsesNativeBindingPrompt(reference)) return original;
 
   // =========================================================================
   // Countdown timer label suppression (2026-03-14 refactor):
@@ -3007,7 +2886,7 @@ const char *__fastcall Detour_SEH_StringEd_GetString(const char *reference) {
   // IAR can detect "Exfil in " text is if SEH returns the real string.
   // CG_DrawHudElem alpha=0 handles English visual suppression instead.
   // =========================================================================
-  if (reference[0] == 'C' && reference[1] == 'L') {
+  if (!TextHook_UsesNativeGameplayText() && reference[0] == 'C' && reference[1] == 'L') {
     if (strcmp(reference, "CLOCKWORK_POWERDOWN") == 0) {
       static const char kSpace[] = " ";
       return kSpace;
@@ -3066,6 +2945,7 @@ const char *__fastcall Detour_SEH_StringEd_GetString(const char *reference) {
   bool isSubtitleKey = (strncmp(reference, "SUBTITLE_", 9) == 0) ||
                        (strncmp(reference, "VIDSUBTITLES_", 13) == 0) ||
                        (strncmp(reference, "INTROSCREEN", 11) == 0);
+  if (TextHook_UsesNativeGameplayText() && strncmp(reference,"INTROSCREEN",11)==0) return original;
   if (isSubtitleKey && strncmp(reference, "INTROSCREEN", 11) != 0) {
     TrackSubtitleSehCaller(reference);
   }
@@ -3164,15 +3044,16 @@ const char *__fastcall Detour_SEH_StringEd_GetString(const char *reference) {
 
     // SUBTITLE processing - queue Korean for D3D11 direct rendering
     if (isSubtitleKey) {
-      g_LastSubtitleActivityTime.store(GetTickCount());
       std::string keyStr = reference ? std::string(reference) : "";
       std::string englishFull = original ? std::string(original) : "";
       std::string englishNorm = NormalizeEnglishKey(englishFull);
       std::string englishClean = StripColorCodes(englishFull);
       int totalChars = (int)englishClean.size();
 
-      // Queue Korean translation for direct rendering
-      {
+      // Dialogue comes from the actual window-4 enqueue, not this lookup.
+      // Keep the separate video subtitle path unchanged.
+      if (refUpper.compare(0,9,"SUBTITLE_")!=0) {
+        g_LastSubtitleActivityTime.store(GetTickCount());
         std::lock_guard<std::mutex> lock(g_InGameSubtitleMutex);
         g_InGameSubtitle.korean = koreanText;
         g_InGameSubtitle.timestamp = TextHook_GetSubtitleClockNow();

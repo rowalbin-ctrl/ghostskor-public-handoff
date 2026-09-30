@@ -1,9 +1,8 @@
 #pragma once
 
 // Computes the 16:9 active rendering area within the backbuffer.
-// Call of Duty: Ghosts always renders at 16:9 internally and adds
-// letterboxing (top/bottom black bars) for narrower aspect ratios
-// like 4:3 or 16:10, or pillarboxing for ultrawide displays.
+// Legacy overlay metric, not an authoritative game viewport. Native UI uses
+// engine draw coordinates; dialogue/video use SubtitleViewport independently.
 //
 // For 16:9 backbuffers the output matches the input exactly (offset = 0).
 

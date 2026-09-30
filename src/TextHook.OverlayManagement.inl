@@ -654,22 +654,6 @@ void TextHook_ResetOverlayRuntime(OverlayResetReason reason) {
     g_RuntimeKeyLastSeenTick.clear();
   }
 
-  // Reset credits guard: clear both soft guard and full guard on any reset.
-  {
-    extern std::atomic<bool> g_creditsGuardActive;
-    extern std::atomic<bool> g_creditsSoftGuard;
-    if (g_creditsGuardActive.load(std::memory_order_relaxed)) {
-      TextHook_ResumeHooksAfterCredits();
-      g_creditsGuardActive.store(false, std::memory_order_relaxed);
-      LogToFile("[CREDITS-GUARD] OFF — overlay reset (full)");
-    }
-    if (g_creditsSoftGuard.load(std::memory_order_relaxed)) {
-      TextHook_SoftResumeSLC();
-      g_creditsSoftGuard.store(false, std::memory_order_relaxed);
-      LogToFile("[CREDITS-GUARD] OFF — overlay reset (soft)");
-    }
-  }
-
   char buf[256];
   sprintf_s(buf, "[OVL-RESET] reason=%d", (int)reason);
   LogToFile(buf);

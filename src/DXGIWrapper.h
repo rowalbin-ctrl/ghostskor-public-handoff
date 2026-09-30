@@ -3,6 +3,10 @@
 #include <d3d11.h>
 #include <dxgi.h>
 
+// Borrow the input and return one owned reference. Rewrapping an existing
+// proxy returns that proxy itself, preserving COM reference ownership.
+extern "C" void *WrapFactory(void *pReal);
+
 class WrappedIDXGISwapChain : public IDXGISwapChain {
 public:
   WrappedIDXGISwapChain(IDXGISwapChain *pReal);
@@ -63,7 +67,7 @@ private:
 
 class WrappedIDXGIFactory : public IDXGIFactory1 {
 public:
-  WrappedIDXGIFactory(IDXGIFactory1 *pReal);
+  WrappedIDXGIFactory(IDXGIFactory *pReal);
   virtual ~WrappedIDXGIFactory();
 
   // IUnknown
@@ -99,6 +103,7 @@ public:
   virtual BOOL STDMETHODCALLTYPE IsCurrent();
 
 private:
-  IDXGIFactory1 *m_pReal;
+  IDXGIFactory *m_pReal;
+  IDXGIFactory1 *m_pReal1;
   std::atomic<ULONG> m_refCount;
 };

@@ -3,7 +3,7 @@
     std::string videoSub = BinkHook::GetCurrentSubtitle();
 
     if (!videoSub.empty()) {
-      extern std::atomic<bool> g_bQueueKeepDuringVideo;
+      extern thread_local std::atomic<bool> g_bQueueKeepDuringVideo;
       g_bQueueKeepDuringVideo.store(true);
 
       static std::string s_lastPassDiagSub;
@@ -15,14 +15,16 @@
         s_lastPassDiagCount = 0;
       }
 
-      if (g_FrameSwapChainDescValid) {
+      if (g_FrameSwapChainDescValid && SubtitleViewport::ValidSize(
+              subtitleAreas.video.width, subtitleAreas.video.height)) {
         const DXGI_SWAP_CHAIN_DESC &scDesc = g_FrameSwapChainDesc;
         float screenWidth = (float)scDesc.BufferDesc.Width;
         float screenHeight = (float)scDesc.BufferDesc.Height;
+        const auto &videoArea = subtitleAreas.video;
 
         // Video subtitle styling (render-format only; timing remains untouched)
-        float subY = g_ActiveArea.offsetY + g_ActiveArea.height * 0.85f;
-        float scale = ComputeVideoSubtitleScale(g_ActiveArea.width, g_ActiveArea.height);
+        float subY = videoArea.offsetY + videoArea.height * 0.85f;
+        float scale = ComputeVideoSubtitleScale(videoArea.width, videoArea.height);
         float fontHeight = 60.0f;
 
         // Engine-derived palette (best-effort): tame neon ^2 and keep a slightly
@@ -52,9 +54,9 @@
           }
         }
 
-        float safeMarginX = (std::max)(24.0f, g_ActiveArea.width * 0.045f);
+        float safeMarginX = (std::max)(24.0f, videoArea.width * 0.045f);
         float maxTextWidth =
-            ComputeSubtitleWrapWidth(g_ActiveArea.width, g_ActiveArea.height, true);
+            ComputeSubtitleWrapWidth(videoArea.width, videoArea.height, true);
         std::vector<std::string> wrappedLines =
             WrapKoreanText(videoSub, maxTextWidth, fontHeight, scale, true);
 
@@ -64,7 +66,7 @@
           float tailWidth = KoreanRenderer::MeasureTextWidthEx(
               wrappedLines.back(), fontHeight, scale);
           if (tailWidth < maxTextWidth * 0.40f) {
-            float safeMaxWidth = g_ActiveArea.width - safeMarginX * 2.0f;
+            float safeMaxWidth = videoArea.width - safeMarginX * 2.0f;
             if (safeMaxWidth < maxTextWidth) {
               safeMaxWidth = maxTextWidth;
             }
@@ -131,10 +133,10 @@
           }
 
           float wWidth = KoreanRenderer::MeasureTextWidthEx(wLine, fontHeight, scale);
-          float wX = g_ActiveArea.offsetX + (g_ActiveArea.width - wWidth) * 0.5f;
+          float wX = videoArea.offsetX + (videoArea.width - wWidth) * 0.5f;
 
-          float minX = g_ActiveArea.offsetX + safeMarginX;
-          float maxX = g_ActiveArea.offsetX + g_ActiveArea.width - safeMarginX - wWidth;
+          float minX = videoArea.offsetX + safeMarginX;
+          float maxX = videoArea.offsetX + videoArea.width - safeMarginX - wWidth;
           if (maxX < minX) {
             maxX = minX;
           }

@@ -1,6 +1,6 @@
 # Current maintenance entry point
 
-The current revision is 2026.09.08 R5. Read README.md, MAINTENANCE_R5.md and
+The current revision is 2026.09.13 R8. Read README.md, MAINTENANCE_R8.md and
 VERSION_SUPPORT.md for current support/validation limits. The text below is
 the original handoff record. Its automatic deployment guidance is historical:
 always build with -NoDeploy and manually copy the DLL to the intended game folder.

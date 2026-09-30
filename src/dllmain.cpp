@@ -5,29 +5,13 @@
 #include "D3D11Hook.h"
 #include "FSHook.h"
 #include "GameBuild.h"
+#include "NativeMenuCapture.h"
 #include "TextHook.h"
 #include "TextReplacer.h"
 #include "TranslationStore.h"
 #include "Utils.h" // Must be first - includes Windows.h and defines GetModuleDirectory
 #include <unordered_map>
 
-// =============================================================
-// PROXY EXPORT: dxgi.dll
-// The game imports dxgi.dll for DirectX. We proxy it.
-// =============================================================
-
-// Helper from DXGIWrapper.cpp
-extern "C" void *WrapFactory(void *pReal);
-
-// IID_IDXGIFactory1: 770aae78-f26f-4dba-a829-253c83d1b387
-const GUID IID_IDXGIFactory1_Local = {
-    0x770aae78,
-    0xf26f,
-    0x4dba,
-    {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};
-
-// Valid DXGI Functions
-HMODULE g_OriginalDXGI = NULL;
 static HMODULE g_hModule = NULL;
 static HANDLE g_InitThread = NULL;
 
@@ -37,99 +21,6 @@ static void ReleaseInitThreadHandle() {
   if (threadHandle) {
     CloseHandle(threadHandle);
   }
-}
-
-// Load original DXGI
-void LoadOriginalDXGI() {
-  if (g_OriginalDXGI)
-    return;
-
-  wchar_t systemPath[MAX_PATH] = {0};
-  if (!GetSystemDirectoryW(systemPath, MAX_PATH)) {
-    return;
-  }
-  wcscat_s(systemPath, L"\\dxgi.dll");
-
-  g_OriginalDXGI = LoadLibraryW(systemPath);
-}
-
-// Proxy exports
-typedef HRESULT(WINAPI *PFN_CreateDXGIFactory)(REFIID, void **);
-typedef HRESULT(WINAPI *PFN_CreateDXGIFactory1)(REFIID, void **);
-typedef HRESULT(WINAPI *PFN_CreateDXGIFactory2)(UINT, REFIID, void **);
-
-static bool CanWrapFactoryRiid(REFIID riid) {
-  return riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIFactory) ||
-         riid == __uuidof(IDXGIFactory1) || riid == IID_IDXGIFactory1_Local;
-}
-
-extern "C" HRESULT WINAPI CreateDXGIFactory(REFIID riid, void **ppFactory) {
-  if (!ppFactory)
-    return E_POINTER;
-  LoadOriginalDXGI();
-  auto func = (PFN_CreateDXGIFactory)GetProcAddress(g_OriginalDXGI,
-                                                    "CreateDXGIFactory");
-  if (!func)
-    return E_FAIL;
-
-  if (!GameBuild::IsSupported() || !CanWrapFactoryRiid(riid))
-    return func(riid, ppFactory);
-
-  // Wrap it
-  void *pTemp = nullptr;
-  HRESULT hr = func(IID_IDXGIFactory1_Local, &pTemp);
-  if (SUCCEEDED(hr) && pTemp) {
-    *ppFactory = WrapFactory(pTemp);
-    ((IUnknown *)pTemp)->Release();
-    return S_OK;
-  }
-  return func(riid, ppFactory);
-}
-
-extern "C" HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **ppFactory) {
-  if (!ppFactory)
-    return E_POINTER;
-  LoadOriginalDXGI();
-  auto func = (PFN_CreateDXGIFactory1)GetProcAddress(g_OriginalDXGI,
-                                                     "CreateDXGIFactory1");
-  if (!func)
-    return E_FAIL;
-
-  if (!GameBuild::IsSupported() || !CanWrapFactoryRiid(riid))
-    return func(riid, ppFactory);
-
-  void *pTemp = nullptr;
-  HRESULT hr = func(riid, &pTemp);
-  if (SUCCEEDED(hr) && pTemp) {
-    *ppFactory = WrapFactory(pTemp);
-    ((IUnknown *)pTemp)->Release();
-    return S_OK;
-  }
-  return hr;
-}
-
-extern "C" HRESULT WINAPI CreateDXGIFactory2(UINT Flags, REFIID riid,
-                                             void **ppFactory) {
-  LoadOriginalDXGI();
-  auto func = (PFN_CreateDXGIFactory2)GetProcAddress(g_OriginalDXGI,
-                                                     "CreateDXGIFactory2");
-  if (!func)
-    return E_FAIL;
-
-  if (!ppFactory)
-    return E_POINTER;
-
-  if (GameBuild::IsSupported() && CanWrapFactoryRiid(riid)) {
-    void *pTemp = nullptr;
-    HRESULT hr = func(Flags, IID_IDXGIFactory1_Local, &pTemp);
-    if (SUCCEEDED(hr) && pTemp) {
-      *ppFactory = WrapFactory(pTemp);
-      ((IUnknown *)pTemp)->Release();
-      return S_OK;
-    }
-  }
-
-  return func(Flags, riid, ppFactory);
 }
 
 DWORD WINAPI MainThread(LPVOID lpParam) {
@@ -173,8 +64,11 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
   // Initialize Hooks
   // Initialize Hooks (Inlined from InitHooks.cpp to fix build)
   LogToFile("Initializing Hooks [RELEASE BUILD]...");
+  NativeMenuCapture::Initialize();
   TextHook::Init();
-  D3D11Hook::InitDXGI();
+  // Factory exports above own DXGI wrapping for the lifetime of the process.
+  // An additional IAT hook resolves back to this proxy and wraps it a second
+  // time when the engine recreates its factory (e.g. vid_restart).
   D3D11Hook::Init();
 
   // FSHook - intercept subtitles.csv and blank the text fields

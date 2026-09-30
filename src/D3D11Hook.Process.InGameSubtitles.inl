@@ -29,18 +29,11 @@
             break;
           const uint32_t *e = (const uint32_t *)ea;
           uint32_t off = e[1], len = e[2];
-          if (len == 0 || len > 512)
+          if (len == 0 || len > 512 || off >= bufSize || len > bufSize)
             break;
           char buf[520];
-          memset(buf, 0, sizeof(buf));
-          if (off + len <= bufSize) {
-            memcpy(buf, (const char *)(ptr3 + off), len);
-          } else {
-            uint32_t fp = bufSize - off;
-            memcpy(buf, (const char *)(ptr3 + off), fp);
-            memcpy(buf + fp, (const char *)ptr3, len - fp);
-          }
-          buf[len] = '\0';
+          if (!SubtitleRing::CopyText(buf, sizeof(buf), (const char*)ptr3,
+                                      bufSize, off, len)) break;
           std::string line(buf);
           if (back == 0)
             joined = line;
@@ -63,7 +56,7 @@
             uint32_t capacity = *(uint32_t *)(slotAddr + 0x1C);
             uint32_t ctr48 = *(uint32_t *)(slotAddr + 0x30);
             uint32_t bufSize = *(uint32_t *)(slotAddr + 0x18);
-            if (capacity == 0 || bufSize == 0)
+            if (capacity == 0 || capacity > 0x7fffffffU / 24 || bufSize == 0)
               continue;
 
             uint32_t oldCtr = s_prevCtr[line];
@@ -85,7 +78,7 @@
             uintptr_t ptr3 = *(uintptr_t *)(slotAddr + 0x10);
             if (!ptr1 || !ptr3)
               continue;
-            if (!IsSafeRead((void *)ptr1, capacity * 24))
+            if (!IsSafeRead((void *)ptr1, (size_t)capacity * 24))
               continue;
             if (!IsSafeRead((void *)ptr3, bufSize))
               continue;
@@ -98,9 +91,9 @@
                 continue;
               const uint32_t *e = (const uint32_t *)ea;
               uint32_t off = e[1], len = e[2];
-              if (len == 0 || len > 512)
+              if (len == 0 || len > 512 || off >= bufSize || len > bufSize)
                 continue;
-              if ((off + len + 1) % bufSize == ctr48) {
+              if (((uint64_t)off + len + 1) % bufSize == ctr48) {
                 matchIdx = i;
                 break;
               }
@@ -190,10 +183,12 @@
         TextHook_GetInGameSubtitleList();
 
     if (!inGameSubs.empty()) {
-      if (g_FrameSwapChainDescValid) {
+      if (g_FrameSwapChainDescValid && SubtitleViewport::ValidSize(
+              subtitleAreas.dialogue.width, subtitleAreas.dialogue.height)) {
         const DXGI_SWAP_CHAIN_DESC &scDesc = g_FrameSwapChainDesc;
         float screenWidth = (float)scDesc.BufferDesc.Width;
         float screenHeight = (float)scDesc.BufferDesc.Height;
+        const auto &dialogueArea = subtitleAreas.dialogue;
 
         // Engine-derived palette (best-effort): used for subtitle base tint and
         // to tame neon ^2 on speaker names.
@@ -252,23 +247,26 @@
         constexpr int kSubtitleSlots = 4;
         float slotAnchorY = 0.0f;
         bool slotAnchorSet = false;
-        const float screenScaleY = g_ActiveArea.height / 720.0f;
+        const float screenScaleY = dialogueArea.height / 720.0f;
         const float minSlotAdvance = 20.0f * screenScaleY;
         const float maxSlotAdvance = 180.0f * screenScaleY;
         const float defaultSlotAdvance = 54.0f * screenScaleY;
         struct SubtitleSlotCache {
           float advance[kSubtitleSlots];
           float scaleY;
+          float width;
           bool initialized;
         };
         static SubtitleSlotCache s_SubtitleSlotCache = {
-            {54.0f, 54.0f, 54.0f, 54.0f}, 1.0f, false};
+            {54.0f, 54.0f, 54.0f, 54.0f}, 1.0f, 0.0f, false};
         if (!s_SubtitleSlotCache.initialized ||
-            fabsf(s_SubtitleSlotCache.scaleY - screenScaleY) > 0.01f) {
+            fabsf(s_SubtitleSlotCache.scaleY - screenScaleY) > 0.01f ||
+            fabsf(s_SubtitleSlotCache.width - dialogueArea.width) > 0.5f) {
           for (int s = 0; s < kSubtitleSlots; ++s) {
             s_SubtitleSlotCache.advance[s] = defaultSlotAdvance;
           }
           s_SubtitleSlotCache.scaleY = screenScaleY;
+          s_SubtitleSlotCache.width = dialogueArea.width;
           s_SubtitleSlotCache.initialized = true;
         }
         float slotAdvance[kSubtitleSlots];
@@ -316,34 +314,23 @@
             if (inGameSub.empty())
               continue;
 
-          if (TextHook_IsMenuContext() || TextHook_IsMenuActiveRaw()) {
-            if (inGameSub.find("킥") != std::string::npos &&
-                inGameSub.find("블랙버드") != std::string::npos &&
-                inGameSub.find("10") != std::string::npos) {
-              continue;
-            }
-            if (inGameSub.find("Kick:") != std::string::npos &&
-                inGameSub.find("Blackbird") != std::string::npos &&
-                (inGameSub.find("ten minutes") != std::string::npos ||
-                 inGameSub.find("ten minute") != std::string::npos)) {
-              continue;
-            }
-          }
-
           // Base style - tuned to match native IW6 subtitle appearance
           // Resolution scaling: glyph pixel size must grow with screen size
           // so that text occupies the same proportion at any resolution.
-          const float resMul = g_ActiveArea.height / 1080.0f;
+          const float resMul = dialogueArea.height / 1080.0f;
           const float baseSubScale = 1.8f;
           float subScale = baseSubScale;
-          float fontHeight = 72.0f * resMul;
+          // About 14% smaller than the previous 72px base. Keep the raised baseline;
+          // normalize before renderer clamps so 4K/8K retain this proportion.
+          float fontHeight = 62.0f * resMul;
+          const HudTextRenderer subtitleText(dialogueArea.height);
           int style = 0;
           // Base color = white for dialogue text; ^2 override handles name color.
           float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
           // Subtitle position: centered at bottom of screen
-          float safeMarginX = g_ActiveArea.width * 0.05f;
-          float baseY = g_ActiveArea.offsetY + g_ActiveArea.height * 0.90f;
+          float safeMarginX = dialogueArea.width * 0.05f;
+          float baseY = dialogueArea.offsetY + dialogueArea.height * 0.90f;
           float baseX = 0.0f; // 0 = center-aligned (handled in render loop)
 
           SubtitleNativeEntry lineState{};
@@ -509,10 +496,10 @@
           // Word-wrap if text is too wide for screen
           // Wrap within safe area (subtract left safe margin, plus right margin)
           float maxTextWidth =
-              ComputeSubtitleWrapWidth(g_ActiveArea.width, g_ActiveArea.height, false);
+              ComputeSubtitleWrapWidth(dialogueArea.width, dialogueArea.height, false);
           std::vector<std::string> wrappedLines =
               WrapKoreanText(renderSub, maxTextWidth, fontHeight, wrapScale,
-                             false);
+                             false, resMul);
           float lineSpacing = fontHeight * (subScale * 0.35f);
 
           // Fixed slot stacking: do not compact on middle-slot removal.
@@ -561,12 +548,12 @@
           for (size_t wl = 0; wl < wrappedLines.size(); ++wl) {
             std::string wLine = wrappedLines[wrappedLines.size() - 1 - wl];
             wLine = EnsureNameHasResetCode(wLine);
-            float wWidth = KoreanRenderer::MeasureTextWidthEx(
+            float wWidth = subtitleText.MeasureTextWidthEx(
                 wLine, fontHeight, subScale);
-            float wX = baseX > 0.0f ? baseX : g_ActiveArea.offsetX + (g_ActiveArea.width - wWidth) * 0.5f;
+            float wX = baseX > 0.0f ? baseX : dialogueArea.offsetX + (dialogueArea.width - wWidth) * 0.5f;
             float clampMarginX = (std::max)(12.0f, safeMarginX);
-            float minX = g_ActiveArea.offsetX + clampMarginX;
-            float maxX = g_ActiveArea.offsetX + g_ActiveArea.width - clampMarginX - wWidth;
+            float minX = dialogueArea.offsetX + clampMarginX;
+            float maxX = dialogueArea.offsetX + dialogueArea.width - clampMarginX - wWidth;
             if (maxX < minX) {
               maxX = minX;
             }
@@ -587,10 +574,10 @@
 
             QueueSubtitleReadabilityPass(wLine, wX, wY, subScale, fontHeight,
                                          wWidth, color[3], dvarFriendlyName,
-                                         dvarFriendlyNameGlow);
+                                         dvarFriendlyNameGlow, resMul);
 
             // Main subtitle text with shadow and native-style glow.
-            KoreanRenderer::QueueText(wLine, wX, wY, subScale, color, fontHeight,
+            subtitleText.QueueText(wLine, wX, wY, subScale, color, fontHeight,
                                       style, wWidth, false, false, 2.0f, false,
                                       true, false, -1, 0.0f, false, false, 0,
                                       &subtitleStylePatch);
@@ -600,7 +587,7 @@
           // so vertical spacing stays stable during character reveal.
           std::vector<std::string> layoutLines =
               WrapKoreanText(inGameSub, maxTextWidth, fontHeight, wrapScale,
-                             false);
+                             false, resMul);
           size_t lineCount = layoutLines.empty() ? wrappedLines.size()
                                                  : layoutLines.size();
           if (lineCount < 1) {
@@ -682,4 +669,3 @@
   }
 
   // ==========================================================================
-

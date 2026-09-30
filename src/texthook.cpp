@@ -1,4 +1,11 @@
 #include "TextHook.h"
+#include "TextIntakePolicy.h"
+#include "NativeBindingPrompt.h"
+#include "NativeHudContext.h"
+#include "TextPerf.h"
+#if GHOSTSKOR_TEXT_PERF
+namespace TextPerf { extern "C" { __declspec(dllexport) Data GhostsKorTextPerf; } }
+#endif
 #include "HudClassify.h"
 
 #include "D3D11Hook.h"
@@ -10,6 +17,9 @@
 #include "GameBuild.h"
 
 #include "KoreanRenderer.h"
+#include "NativeMenuCapture.h"
+#include "NativeMenuDraw.h"
+#include "MenuTrace.h"
 #include "BindingResolver.h"
 #include "ObjectiveRuntime.h"
 #include "ObjectiveRendererUnified.h"
@@ -1314,13 +1324,8 @@ float GetMenuFontScaleMul(float fontHeight, bool isMenuContext,
       (screenHeight > 0.0f) ? screenHeight : GetScreenHeightApprox();
   float safeWidth = (screenWidth > 0.0f) ? screenWidth : GetScreenWidthApprox();
 
-  // Remap coordinates from full backbuffer space to 16:9 active area space.
-  if (g_ActiveArea.height > 1.0f && g_ActiveArea.height < safeHeight - 1.0f) {
-    y -= g_ActiveArea.offsetY;
-    x -= g_ActiveArea.offsetX;
-    safeHeight = g_ActiveArea.height;
-    safeWidth = g_ActiveArea.width;
-  }
+  // R_AddCmdDrawText supplies menu coordinates in full backbuffer pixels.
+  // Applying the HUD's 16:9 letterbox transform here misclassifies 4:3 headers.
 
   float edgeMargin = safeHeight * (kEdgeMarginBase / kBaseScreenHeight);
   float centerBandY = safeHeight * (kCenterBandYBase / kBaseScreenHeight);
@@ -1943,10 +1948,10 @@ static std::atomic<bool> g_hasObjSuppressed{false};
 // after return.  SEH_StringEd_GetString (which runs inside CG_DrawHudElem) can
 // read this to obtain the hudelem_s pointer reliably — no RDI heuristic needed.
 // Only valid on the engine's main render thread (single-threaded game loop).
-static std::atomic<uintptr_t> g_CGDrawHudElem_ElemPtr{0};
+
 
 uintptr_t TextHook_GetCGDrawHudElemPtr() {
-  return g_CGDrawHudElem_ElemPtr.load(std::memory_order_acquire);
+  return NativeHudContext::Get();
 }
 
 // CG_DrawHudElem → R_AddCmdDrawText variable capture.
@@ -2311,134 +2316,8 @@ void TextHook_ObjSuppressReapplyOffscreen() {
 static std::unordered_map<uint32_t, std::string> g_slcToKey;
 static std::mutex g_slcToKeyMutex;
 
-// Credits guard: activated when the final story subtitle
-// (SUBTITLE_SKYWAY_HSH_IMPROUDOFYOU1111 = "I'm proud of you, Logan.") is seen.
-// Suppresses HUD hint detection and objective processing during credits.
-// Reset on OVL-RESET (checkpoint restart, mission restart, main menu).
-std::atomic<bool> g_creditsGuardActive{false};
-
-// Soft guard: SLC raw hook disabled only.  All other hooks (IntroTextLayout,
-// IntroRenderFn, Cbuf, R_AddCmdDrawText) remain active.  Activated by
-// ui_play_credits SLC detection.  Upgraded to full guard when IntroTextLayout
-// sees CREDITS_* keys (credits rendering), or cancelled when IntroTextLayout
-// sees non-CREDITS_* keys (gameplay started).
-std::atomic<bool> g_creditsSoftGuard{false};
-
-
-// Legacy Method 1+2 globals (kept to avoid linker errors; no longer used for guard logic).
-std::atomic<DWORD>    g_lastBinkVideoCloseTick{0};
-std::atomic<DWORD>    g_lastBinkVideoOpenTick{0};
+// Frame counter is also used by DXGI diagnostics. No scene disables hooks.
 std::atomic<uint64_t> g_presentFrameCount{0};
-std::atomic<uint64_t> g_presentFrameAtLastVideoClose{0};
-
-
-
-
-// =============================================================================
-// Soft SLC suspend: disable ONLY the SLC raw hook.  All MinHook hooks stay
-// active so IntroTextLayout can distinguish credits vs gameplay rendering.
-// =============================================================================
-static std::atomic<bool> g_slcSoftSuspended{false};
-
-void TextHook_SoftSuspendSLC() {
-  if (g_slcSoftSuspended.load(std::memory_order_relaxed))
-    return;
-  if (g_SLC_HookApplied && g_SLC_TargetAddr) {
-    DWORD oldProtect;
-    if (VirtualProtect(g_SLC_TargetAddr, 14, PAGE_EXECUTE_READWRITE,
-                       &oldProtect)) {
-      memcpy(g_SLC_TargetAddr, g_SLC_OriginalBytes, 14);
-      VirtualProtect(g_SLC_TargetAddr, 14, oldProtect, &oldProtect);
-      FlushInstructionCache(GetCurrentProcess(), g_SLC_TargetAddr, 14);
-    }
-  }
-  g_slcSoftSuspended.store(true, std::memory_order_relaxed);
-  LogToFile("[CREDITS-HOOKS] SLC soft-suspended");
-}
-
-void TextHook_SoftResumeSLC() {
-  if (!g_slcSoftSuspended.load(std::memory_order_relaxed))
-    return;
-  if (g_SLC_HookApplied && g_SLC_TargetAddr && g_SLC_PreStub) {
-    DWORD oldProtect;
-    if (VirtualProtect(g_SLC_TargetAddr, 14, PAGE_EXECUTE_READWRITE,
-                       &oldProtect)) {
-      unsigned char *bytes = (unsigned char *)g_SLC_TargetAddr;
-      bytes[0] = 0xFF;
-      bytes[1] = 0x25;
-      *(uint32_t *)(bytes + 2) = 0;
-      *(uint64_t *)(bytes + 6) = (uint64_t)g_SLC_PreStub;
-      VirtualProtect(g_SLC_TargetAddr, 14, oldProtect, &oldProtect);
-      FlushInstructionCache(GetCurrentProcess(), g_SLC_TargetAddr, 14);
-    }
-  }
-  g_slcSoftSuspended.store(false, std::memory_order_relaxed);
-  LogToFile("[CREDITS-HOOKS] SLC soft-resumed");
-}
-
-// =============================================================================
-// Credits hook suspension: disable ALL hooks during credits to eliminate
-// trampoline overhead completely.  Re-enable on overlay reset.
-// Cbuf_AddText is kept alive for restart/disconnect detection.
-// =============================================================================
-static std::atomic<bool> g_hooksSuspendedForCredits{false};
-
-void TextHook_SuspendHooksForCredits() {
-  if (g_hooksSuspendedForCredits.load(std::memory_order_relaxed))
-    return;
-
-  // 1. Restore SLC original bytes (custom raw hook, not MinHook)
-  if (g_SLC_HookApplied && g_SLC_TargetAddr) {
-    DWORD oldProtect;
-    if (VirtualProtect(g_SLC_TargetAddr, 14, PAGE_EXECUTE_READWRITE,
-                       &oldProtect)) {
-      memcpy(g_SLC_TargetAddr, g_SLC_OriginalBytes, 14);
-      VirtualProtect(g_SLC_TargetAddr, 14, oldProtect, &oldProtect);
-      FlushInstructionCache(GetCurrentProcess(), g_SLC_TargetAddr, 14);
-    }
-  }
-
-  // 2. Disable ALL MinHook hooks, then re-enable essential ones:
-  //    - Cbuf_AddText: restart/disconnect detection → credits guard reset
-  //    - R_AddCmdDrawText: Korean menu text during credits pause menu
-  MH_DisableHook(MH_ALL_HOOKS);
-  if (g_Cbuf_AddText_TargetAddr) {
-    MH_EnableHook(g_Cbuf_AddText_TargetAddr);
-  }
-  if (g_TargetAddr) { // R_AddCmdDrawText
-    MH_EnableHook(g_TargetAddr);
-  }
-
-  g_hooksSuspendedForCredits.store(true, std::memory_order_relaxed);
-  LogToFile("[CREDITS-HOOKS] All hooks SUSPENDED for credits");
-}
-
-void TextHook_ResumeHooksAfterCredits() {
-  if (!g_hooksSuspendedForCredits.load(std::memory_order_relaxed))
-    return;
-
-  // 1. Re-apply SLC raw hook
-  if (g_SLC_HookApplied && g_SLC_TargetAddr && g_SLC_PreStub) {
-    DWORD oldProtect;
-    if (VirtualProtect(g_SLC_TargetAddr, 14, PAGE_EXECUTE_READWRITE,
-                       &oldProtect)) {
-      unsigned char *bytes = (unsigned char *)g_SLC_TargetAddr;
-      bytes[0] = 0xFF;
-      bytes[1] = 0x25;
-      *(uint32_t *)(bytes + 2) = 0;
-      *(uint64_t *)(bytes + 6) = (uint64_t)g_SLC_PreStub;
-      VirtualProtect(g_SLC_TargetAddr, 14, oldProtect, &oldProtect);
-      FlushInstructionCache(GetCurrentProcess(), g_SLC_TargetAddr, 14);
-    }
-  }
-
-  // 2. Re-enable ALL MinHook hooks
-  MH_EnableHook(MH_ALL_HOOKS);
-
-  g_hooksSuspendedForCredits.store(false, std::memory_order_relaxed);
-  g_slcSoftSuspended.store(false, std::memory_order_relaxed); // clear soft flag too
-  LogToFile("[CREDITS-HOOKS] All hooks RESUMED after credits");
-}
 
 struct AuthoritativeObjectiveTextEvent {
   uint32_t cfgIndex = 0;
@@ -3633,8 +3512,8 @@ static void QueueHudScriptCountdownOverlay(const HudScriptCountdownMatch &match,
     return v;
   };
 
-  extern std::atomic<bool> g_bQueueFromMenu;
-  extern std::atomic<bool> g_bQueueKeepDuringVideo;
+  extern thread_local std::atomic<bool> g_bQueueFromMenu;
+  extern thread_local std::atomic<bool> g_bQueueKeepDuringVideo;
   g_bQueueFromMenu.store(false);
   g_bQueueKeepDuringVideo.store(false);
 
@@ -4779,29 +4658,8 @@ HudStateSignalSnapshot TextHook_GetHudStateSignalSnapshot() {
   if (TryReadDvarBoolValue(s_cache.hideHudFast, bv)) {
     snap.hideHudFast = bv;
   }
-  // Credits detection: subtitle-triggered guard + dvar fallback.
-  // The guard activates when SUBTITLE_SKYWAY_HSH_IMPROUDOFYOU1111
-  // ("I'm proud of you, Logan.") fires pre-credits. Reset on OVL-RESET.
-  {
-    extern std::atomic<bool> g_creditsGuardActive;
-    const bool guard = g_creditsGuardActive.load(std::memory_order_relaxed);
-    bool dvarCredits = false;
-    if (TryReadDvarBoolValue(s_cache.creditsActive, bv)) {
-      dvarCredits = bv;
-    }
-    snap.creditsActive = guard || dvarCredits;
-
-    if (snap.creditsActive) {
-      static DWORD s_lastCreditsSnapLog = 0;
-      if ((now - s_lastCreditsSnapLog) > 3000) {
-        s_lastCreditsSnapLog = now;
-        char csbuf[128];
-        sprintf_s(csbuf, "[CREDITS-SNAP] creditsActive=1 guard=%d dvar=%d",
-                  guard ? 1 : 0, dvarCredits ? 1 : 0);
-        LogToFile(csbuf);
-      }
-    }
-  }
+  // Engine UI state only; never used to suspend translation hooks.
+  if (TryReadDvarBoolValue(s_cache.creditsActive, bv)) snap.creditsActive = bv;
   if (TryReadDvarBoolValue(s_cache.hudShowObjectives, bv)) {
     snap.hudShowObjectives = bv;
   }
@@ -7855,16 +7713,6 @@ void TextHook_ResetGameTimeDiscovery() {
 // =============================================================================
 void TextHook_ReadLiveHudElems() {
 
-  // Credits guard: skip the entire 2048-element HudElem scan during credits.
-  // This is the main per-frame CPU cost — each iteration does multiple memory
-  // probes, key resolution, and objective/countdown classification.
-  {
-    extern std::atomic<bool> g_creditsGuardActive;
-    if (g_creditsGuardActive.load(std::memory_order_relaxed)) {
-      return;
-    }
-  }
-
   static uintptr_t s_moduleBase = (uintptr_t)GetModuleHandleA(NULL);
   const uintptr_t fixedBase = s_moduleBase + IW6Offsets::HudElem_Array_SP;
   const int fixedStride = IW6Offsets::HudElem_Array_Stride_SP;
@@ -8076,6 +7924,17 @@ void TextHook_ReadLiveHudElems() {
       continue;
     }
     const bool isTextElem = (t == 1);
+    // Resolve this native text slot before any objective/timer reverse work.
+    // Exclude credits here, but keep native localized/literal messages and
+    // resolved English for the existing translation resolver below.
+    if (isTextElem) {
+      uint32_t textCfg = 0, labelCfg = 0;
+      if (!ObjRev_ReadU32(elem + 0x84, textCfg) ||
+          !ObjRev_ReadU32(elem + 0x40, labelCfg)) continue;
+      if (!IsNativeHudConfigRelevant(textCfg) &&
+          !IsNativeHudConfigRelevant(labelCfg)) continue;
+    }
+
     // When type=0 and we're actively suppressing this element (zeroed type),
     // treat it as a timer element so the scanner still processes it.
     const bool isSuppressedTimer =

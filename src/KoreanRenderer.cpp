@@ -1,6 +1,11 @@
 #include "KoreanRenderer.h"
 #include "BinkHook.h"
 #include "GameViewport.h"
+#include "NativeMenuCapture.h"
+#include "NativeMenuDraw.h"
+#include "StateSaver.h"
+#include "MenuFrameBuffer.h"
+#include "MenuTrace.h"
 #include "TextHook.h"
 #include "GamepadGlyphAtlas.h"
 #include <DirectXMath.h> // For matrix
@@ -40,6 +45,8 @@ ID3D11BlendState *KoreanRenderer::s_pBlendState = nullptr;
 ID3D11BlendState *KoreanRenderer::s_pBlendStateAdditive = nullptr;
 ID3D11DepthStencilState *KoreanRenderer::s_pNoDepthStencilState = nullptr;
 ID3D11Buffer *KoreanRenderer::s_pVertexBuffer = nullptr;
+static ID3D11Buffer *s_pNativeVertexBuffer = nullptr;
+static constexpr int kNativeRegionSize = 2048;
 ID3D11Buffer *KoreanRenderer::s_pConstantBuffer = nullptr;
 ID3D11ShaderResourceView *KoreanRenderer::s_pTextureView = nullptr;
 ID3D11ShaderResourceView *KoreanRenderer::s_pGlowTextureView = nullptr;
@@ -53,6 +60,17 @@ bool KoreanRenderer::s_bInitialized = false;
 
 // Staging buffer: QueueText pushes here; Render splits by source each frame.
 static std::vector<DrawCommand> s_StageList;
+static MenuFrameBuffer<DrawCommand> s_MenuFrames;
+
+void KoreanRenderer::BeginMenuFrame() {
+  std::lock_guard<std::mutex> lock(s_RenderMutex);
+  s_MenuFrames.Begin();
+}
+void KoreanRenderer::EndMenuFrame() {
+  std::lock_guard<std::mutex> lock(s_RenderMutex);
+  s_MenuFrames.End();
+  NativeMenuCapture::Trace(10, nullptr, (float)s_MenuFrames.Current().size());
+}
 
 // QTE overlay: temporarily relax CalculateFinalScale clamps for QTE commands.
 static bool s_QteScaleMode = false;
@@ -60,8 +78,8 @@ void KoreanRenderer::SetQteScaleMode(bool on) { s_QteScaleMode = on; }
 
 // Global flag: set true by R_AddCmdDrawText detour, false otherwise.
 // QueueText reads this to tag each DrawCommand with its source.
-std::atomic<bool> g_bQueueFromMenu{false};
-std::atomic<bool> g_bQueueKeepDuringVideo{false};
+thread_local std::atomic<bool> g_bQueueFromMenu{false};
+thread_local std::atomic<bool> g_bQueueKeepDuringVideo{false};
 static std::atomic<int> g_RorkeDetailPageId{0};
 static std::atomic<DWORD> g_RorkeDetailPageTick{0};
 static std::atomic<DWORD> g_RorkeDetailActiveTick{0};
@@ -242,15 +260,6 @@ void KoreanRenderer_LatchRorkeDetailBodyLayout(int pageId, float x, float y,
 // on menu transitions). When R_AddCmdDrawText fires with partial data (some
 // items rejected by alpha threshold), uncached items retain their last good
 // version. HUD/subtitle items bypass the cache entirely.
-struct CachedMenuCmd {
-  uint64_t key;
-  uint64_t posKey;
-  DrawCommand cmd;
-  unsigned long lastSeen;
-};
-static std::vector<CachedMenuCmd> s_MenuItemCache;
-static constexpr unsigned long kMenuItemTTLMs = 30;
-
 struct MenuLayoutMetrics {
   float contentLeft;
   float contentTop;
@@ -488,13 +497,12 @@ static MenuLayoutMetrics ComputeMenuLayoutMetrics(const D3D11_VIEWPORT &vp,
   const float vpW = (vp.Width > 1.0f) ? vp.Width : 1.0f;
   const float vpH = (vp.Height > 1.0f) ? vp.Height : 1.0f;
 
-  // Use 16:9 active area for content bounds so that header/footer/body
-  // classification zones match the game's actual rendering area, not the
-  // full backbuffer (which may include letterbox/pillarbox regions).
-  const float areaW = (g_ActiveArea.width > 1.0f) ? g_ActiveArea.width : vpW;
-  const float areaH = (g_ActiveArea.height > 1.0f) ? g_ActiveArea.height : vpH;
-  const float areaOffX = g_ActiveArea.offsetX;
-  const float areaOffY = g_ActiveArea.offsetY;
+  // Menu draw positions and engine scissors are already in backbuffer pixels.
+  // The campaign HUD's 16:9 active area is not the menu coordinate system.
+  const float areaW = vpW;
+  const float areaH = vpH;
+  const float areaOffX = vp.TopLeftX;
+  const float areaOffY = vp.TopLeftY;
 
   const float safeX = ClampFloat(safeArea.x, 0.0f, areaW * 0.20f);
   const float safeY = ClampFloat(safeArea.y, 0.0f, areaH * 0.20f);
@@ -544,51 +552,38 @@ static MenuLayoutMetrics ComputeMenuLayoutMetrics(const D3D11_VIEWPORT &vp,
   return m;
 }
 
-// Hash on text + coarse X/Y buckets.
-// We keep buckets coarse enough to absorb per-frame jitter while still
-// separating independent UI columns (left list vs right header).
-static uint64_t MenuCmdHash(const std::string &text, float x, float y,
-                            float xBucketPx = 160.0f,
-                            float yBucketPx = 20.0f) {
-  uint64_t h = 0xcbf29ce484222325ULL;
-  for (size_t i = 0; i < text.size(); ++i) {
-    h ^= (uint64_t)(unsigned char)text[i];
-    h *= 0x100000001b3ULL;
-  }
-  const float safeXBucket = (xBucketPx > 1.0f) ? xBucketPx : 1.0f;
-  const float safeYBucket = (yBucketPx > 1.0f) ? yBucketPx : 1.0f;
-  int xBucket = (int)(x / safeXBucket);
-  h ^= (uint64_t)(unsigned)xBucket;
-  h *= 0x100000001b3ULL;
-  int yBucket = (int)(y / safeYBucket);
-  h ^= (uint64_t)(unsigned)yBucket;
-  h *= 0x100000001b3ULL;
-  return h;
-}
-
-// Position-only hash (coarse X/Y buckets).
-// Used to replace stale cached entries when text changes at the same anchor
-// (prevents short-lived "ghost" trails on rapidly updating menu labels).
-static uint64_t MenuCmdPosHash(float x, float y, float xBucketPx = 160.0f,
-                               float yBucketPx = 20.0f) {
-  uint64_t h = 0xcbf29ce484222325ULL;
-  const float safeXBucket = (xBucketPx > 1.0f) ? xBucketPx : 1.0f;
-  const float safeYBucket = (yBucketPx > 1.0f) ? yBucketPx : 1.0f;
-  int xBucket = (int)(x / safeXBucket);
-  h ^= (uint64_t)(unsigned)xBucket;
-  h *= 0x100000001b3ULL;
-  int yBucket = (int)(y / safeYBucket);
-  h ^= (uint64_t)(unsigned)yBucket;
-  h *= 0x100000001b3ULL;
-  return h;
-}
-
 // Vertex Structure
 struct SimpleVertex {
   XMFLOAT2 Pos;
   XMFLOAT4 Color;
   XMFLOAT2 UV;
 };
+
+// Clip each generated glyph/shadow/glow/button quad in pixels, adjusting UVs
+// at the boundary. Do not discard a whole line just because its baseline lies
+// outside a guessed menu band. Batches keep their original atlas and blend mode.
+static void ClipGeneratedQuads(SimpleVertex *vertices, int begin, int &count,
+                               const MenuClipRect &clip, float width, float height) {
+  if (!clip.enabled) return;
+  int write = begin;
+  for (int i = begin; i + 5 < count; i += 6) {
+    const auto tl = vertices[i];
+    const auto br = vertices[i + 4];
+    MenuQuad q{(tl.Pos.x + 1) * width * .5f, (1 - tl.Pos.y) * height * .5f,
+               (br.Pos.x + 1) * width * .5f, (1 - br.Pos.y) * height * .5f,
+               tl.UV.x, tl.UV.y, br.UV.x, br.UV.y};
+    if (!ClipMenuQuad(q, clip)) continue;
+    const float l = q.left * 2 / width - 1, r = q.right * 2 / width - 1;
+    const float t = 1 - q.top * 2 / height, b = 1 - q.bottom * 2 / height;
+    vertices[write++] = {{l,t}, tl.Color, {q.u0,q.v0}};
+    vertices[write++] = {{r,t}, tl.Color, {q.u1,q.v0}};
+    vertices[write++] = {{l,b}, tl.Color, {q.u0,q.v1}};
+    vertices[write++] = {{r,t}, tl.Color, {q.u1,q.v0}};
+    vertices[write++] = {{r,b}, tl.Color, {q.u1,q.v1}};
+    vertices[write++] = {{l,b}, tl.Color, {q.u0,q.v1}};
+  }
+  count = write;
+}
 
 // Shader Code (Texture Support)
 const char *VS_CODE = R"(
@@ -705,6 +700,7 @@ void KoreanRenderer::Init(ID3D11Device *pDevice,
 }
 
 void KoreanRenderer::Cleanup() {
+  GamepadGlyphAtlas::Shutdown();
   if (s_pVS)
     s_pVS->Release();
   s_pVS = nullptr;
@@ -729,6 +725,8 @@ void KoreanRenderer::Cleanup() {
   if (s_pVertexBuffer)
     s_pVertexBuffer->Release();
   s_pVertexBuffer = nullptr;
+  if (s_pNativeVertexBuffer) s_pNativeVertexBuffer->Release();
+  s_pNativeVertexBuffer = nullptr;
   if (s_pConstantBuffer)
     s_pConstantBuffer->Release();
   s_pConstantBuffer = nullptr;
@@ -749,7 +747,7 @@ void KoreanRenderer::Cleanup() {
   s_pSamplerState = nullptr;
   s_DrawList.clear();
   s_StageList.clear();
-  s_MenuItemCache.clear();
+  s_MenuFrames.Clear();
   s_Atlas2MetricsLoaded = false;
   s_Atlas2FallbackWarned = false;
   s_bInitialized = false;
@@ -766,27 +764,6 @@ void KoreanRenderer::QueueText(const std::string &text, float x, float y,
                                uint8_t atlasSlot,
                                const DrawStylePatch *stylePatch,
                                float resolutionScale) {
-  // Hard suppression for Clockwork Kick subtitle when menu is active
-  if (TextHook_IsMenuContext() || TextHook_IsMenuActiveRaw()) {
-    std::string clean = text;
-    // Strip color codes
-    for (size_t i = 0; i < clean.size();) {
-      if (clean[i] == '^' && i + 1 < clean.size()) {
-        clean.erase(i, 2);
-        continue;
-      }
-      i++;
-    }
-    if ((clean.find("킥") != std::string::npos &&
-         clean.find("블랙버드") != std::string::npos &&
-         clean.find("10분") != std::string::npos) ||
-        (clean.find("Kick:") != std::string::npos &&
-         clean.find("Blackbird") != std::string::npos &&
-         (clean.find("ten minutes") != std::string::npos ||
-          clean.find("ten minute") != std::string::npos))) {
-      return;
-    }
-  }
   // Ideally use mutex here if multithreading Queue vs Render
   std::lock_guard<std::mutex> lock(s_RenderMutex);
   DrawCommand cmd;
@@ -857,12 +834,28 @@ void KoreanRenderer::QueueText(const std::string &text, float x, float y,
     }
   }
   cmd.isMenuSource = g_bQueueFromMenu.load();
+  cmd.nativeMenu = cmd.isMenuSource && NativeMenuCapture::IsFrameActive();
+  if (cmd.nativeMenu) cmd.menuClip = NativeMenuCapture::CurrentClip();
+  NativeMenuCapture::Trace(cmd.nativeMenu ? 8 : 9, text.c_str(), x, y, scale, fontHeight);
   cmd.keepDuringVideo = g_bQueueKeepDuringVideo.load();
   cmd.yIsTopOfText = yIsTopOfText;
   cmd.atlasSlot = (atlasSlot == KoreanAtlas::kAtlasSlotHeader)
                       ? KoreanAtlas::kAtlasSlotHeader
                       : KoreanAtlas::kAtlasSlotBase;
   cmd.qteScaleMode = s_QteScaleMode;
+  cmd.nativeText = cmd.nativeMenu ? NativeMenuCapture::CurrentText() : NativeTextLayout{};
+  if (cmd.nativeText.valid) {
+    // Translation selects text; the engine owns geometry and font metrics.
+    cmd.x = cmd.nativeText.x;
+    cmd.y = cmd.nativeText.y;
+    cmd.finalWidthEng = cmd.nativeText.width;
+    cmd.forceAlign = cmd.nativeText.alignment;
+    cmd.maxWidthPx = cmd.nativeText.maxWidth;
+    cmd.disableAutoWrap = !(cmd.maxWidthPx > 0);
+    cmd.yIsTopOfText = false;
+    cmd.isSmallMenu = false;
+    cmd.atlasSlot = cmd.nativeText.atlasSlot;
+  }
   if (color) {
     cmd.r = color[0];
     cmd.g = color[1];
@@ -881,7 +874,11 @@ void KoreanRenderer::QueueText(const std::string &text, float x, float y,
     return;
   }
 
-  s_StageList.push_back(cmd);
+  if (cmd.nativeMenu && NativeMenuDraw::Queue(cmd)) return;
+  if (cmd.nativeMenu)
+    s_MenuFrames.Add(std::move(cmd));
+  else
+    s_StageList.push_back(std::move(cmd));
 }
 
 void KoreanRenderer::SetLastCommandGlow(float r, float g, float b, float a) {
@@ -1001,6 +998,9 @@ void KoreanRenderer::CreateBuffers() {
   bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
   bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
   s_pDevice->CreateBuffer(&bd, nullptr, &s_pVertexBuffer);
+  // Small labels must not rename the multi-megabyte HUD buffer per command.
+  bd.ByteWidth = sizeof(SimpleVertex) * (kNativeRegionSize * 4 + 512);
+  s_pDevice->CreateBuffer(&bd, nullptr, &s_pNativeVertexBuffer);
 
   // Constant Buffer (Matrix)
   bd.Usage = D3D11_USAGE_DEFAULT;
@@ -1295,12 +1295,10 @@ float KoreanRenderer::CalculateFinalScale(float fontHeight, float cmdScale,
 // -----------------------------------------------------------------------------
 // Precise Text Width Measurement (Ex)
 // -----------------------------------------------------------------------------
-float KoreanRenderer::MeasureTextWidthEx(const std::string &text,
-                                         float fontHeight, float scale,
-                                         uint8_t atlasSlot,
-                                         float resolutionScale) {
-  float finalScale = CalculateFinalScale(fontHeight, scale, resolutionScale);
-
+static float MeasureAtlasTextWidth(const std::string &text, float finalScale,
+                                   uint8_t atlasSlot, const GamepadGlyphAtlas::Atlas* buttons,
+                                   float buttonHeight = 0) {
+  if (!(buttonHeight > 0)) buttonHeight = KoreanAtlas::GLYPH_SIZE_BASE * finalScale;
   float curWidth = 0.0f;
   float maxWidth = 0.0f;
   const char *p = text.c_str();
@@ -1323,7 +1321,7 @@ float KoreanRenderer::MeasureTextWidthEx(const std::string &text,
 
     // Button glyph control chars: one square
     if (cp >= 1 && cp <= 23) {
-      curWidth += KoreanAtlas::GLYPH_SIZE_BASE * finalScale * 1.4f * 1.08f;
+      curWidth += GamepadGlyphAtlas::Advance(buttons, cp, buttonHeight);
       continue;
     }
 
@@ -1342,11 +1340,89 @@ float KoreanRenderer::MeasureTextWidthEx(const std::string &text,
   return (std::max)(maxWidth, curWidth);
 }
 
-void KoreanRenderer::Render() {
+float KoreanRenderer::MeasureTextWidthEx(const std::string &text,
+    float fontHeight, float scale, uint8_t atlasSlot, float resolutionScale) {
+  const auto buttons = GamepadGlyphAtlas::Acquire();
+  return MeasureAtlasTextWidth(text, CalculateFinalScale(fontHeight, scale, resolutionScale), atlasSlot, buttons.get());
+}
+
+void KoreanRenderer::Render() { RenderCommands(nullptr); }
+
+void KoreanRenderer::RenderNativeBatch(const std::vector<DrawCommand> &batch) {
+  RenderCommands(&batch);
+}
+
+void KoreanRenderer::RenderNativeGlyphQuads(const std::vector<NativeGlyphQuad> &quads) {
+  if (quads.empty() || !s_bInitialized) return;
+  std::lock_guard<std::mutex> lock(s_RenderMutex);
+  if (!s_pContext || !s_pTextureView || !s_pNativeVertexBuffer) return;
+  D3D11StateSaver saved(s_pContext);
+  saved.Save();
+  UINT count=1;
+  D3D11_VIEWPORT viewport{};
+  s_pContext->RSGetViewports(&count,&viewport);
+  if (viewport.Width<=0 || viewport.Height<=0) return;
+  auto matrix=XMMatrixTranspose(XMMatrixIdentity());
+  s_pContext->UpdateSubresource(s_pConstantBuffer,0,nullptr,&matrix,0,0);
+  const float blend[4]{};
+  s_pContext->OMSetBlendState(s_pBlendState,blend,0xffffffff);
+  s_pContext->OMSetDepthStencilState(s_pNoDepthStencilState,0);
+  s_pContext->RSSetState(s_pRasterizerState);
+  s_pContext->GSSetShader(nullptr,nullptr,0);
+  s_pContext->HSSetShader(nullptr,nullptr,0);
+  s_pContext->DSSetShader(nullptr,nullptr,0);
+  s_pContext->VSSetShader(s_pVS,nullptr,0);
+  s_pContext->PSSetShader(s_pPS,nullptr,0);
+  s_pContext->VSSetConstantBuffers(0,1,&s_pConstantBuffer);
+  s_pContext->PSSetSamplers(0,1,&s_pSamplerState);
+  UINT stride=sizeof(SimpleVertex),offset=0;
+  s_pContext->IASetVertexBuffers(0,1,&s_pNativeVertexBuffer,&stride,&offset);
+  s_pContext->IASetInputLayout(s_pInputLayout);
+  s_pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  for (size_t begin=0;begin<quads.size();) {
+    size_t end=begin+1;
+    while (end<quads.size() && end-begin<1024 && quads[end].glow==quads[begin].glow) ++end;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(s_pContext->Map(s_pNativeVertexBuffer,0,D3D11_MAP_WRITE_DISCARD,0,&mapped))) return;
+    auto *out=static_cast<SimpleVertex*>(mapped.pData);
+    for (size_t i=begin;i<end;++i) {
+      const auto &q=quads[i];
+      const XMFLOAT4 rgba((q.color&255)/255.f,((q.color>>8)&255)/255.f,
+          ((q.color>>16)&255)/255.f,((q.color>>24)&255)/255.f);
+      for (int corner : {0,1,2,0,2,3}) {
+        out->Pos=XMFLOAT2((q.x[corner]-viewport.TopLeftX)*2/viewport.Width-1,
+            1-(q.y[corner]-viewport.TopLeftY)*2/viewport.Height);
+        out->Color=rgba;
+        out->UV=XMFLOAT2(corner==0 || corner==3?q.u0:q.u1,corner<2?q.v0:q.v1);
+        ++out;
+      }
+    }
+    s_pContext->Unmap(s_pNativeVertexBuffer,0);
+    auto *texture=quads[begin].glow && s_pGlowTextureView?s_pGlowTextureView:s_pTextureView;
+    // The native loop can submit glow after the face. A dark glow colour
+    // must add light, not cover the face with an opaque black rectangle.
+    s_pContext->OMSetBlendState(quads[begin].glow?s_pBlendStateAdditive:s_pBlendState,blend,0xffffffff);
+    s_pContext->PSSetShaderResources(0,1,&texture);
+    s_pContext->Draw((UINT)((end-begin)*6),0);
+    begin=end;
+  }
+}
+
+void KoreanRenderer::RenderCommands(const std::vector<DrawCommand> *nativeBatch) {
+  const auto buttonAtlas = GamepadGlyphAtlas::Acquire();
+  NativeMenuCapture::Trace(13, nullptr, s_bInitialized ? 1.0f : 0.0f, s_pTextureView ? 1.0f : 0.0f);
   if (!s_bInitialized || !s_pTextureView)
     return;
 
   std::lock_guard<std::mutex> lock(s_RenderMutex);
+  if (!s_bInitialized || !s_pContext || !s_pTextureView) return;
+  D3D11StateSaver orderedState(nativeBatch ? s_pContext : nullptr);
+  if (nativeBatch) {
+    orderedState.Save();
+    s_pContext->GSSetShader(nullptr, nullptr, 0);
+    s_pContext->HSSetShader(nullptr, nullptr, 0);
+    s_pContext->DSSetShader(nullptr, nullptr, 0);
+  }
 
   UINT numViewports = 1;
   D3D11_VIEWPORT vp = {};
@@ -1358,14 +1434,14 @@ void KoreanRenderer::Render() {
   const MenuLayoutMetrics menuMetrics =
       ComputeMenuLayoutMetrics(vp, engineSafeArea);
   const bool inMenuContextGlobal =
-      TextHook_IsMenuContext() || TextHook_IsMenuActiveRaw();
+      !nativeBatch && (TextHook_IsMenuContext() || TextHook_IsMenuActiveRaw());
   const bool videoPlaying = BinkHook::IsCutsceneVideoPlaying();
   static bool s_LastVideoPlaying = false;
-  if (videoPlaying && !s_LastVideoPlaying) {
-    s_MenuItemCache.clear();
+  if (!nativeBatch && videoPlaying && !s_LastVideoPlaying) {
+    s_MenuFrames.Clear();
     s_DrawList.clear();
   }
-  s_LastVideoPlaying = videoPlaying;
+  if (!nativeBatch) s_LastVideoPlaying = videoPlaying;
 
 #if GHOSTSKOR_RUNTIME_DIAG
   if (inMenuContextGlobal) {
@@ -1390,186 +1466,27 @@ void KoreanRenderer::Render() {
   }
 #endif
 
-  // Split staged items by source: menu (R_AddCmdDrawText) vs HUD (ProcessSubtitles).
-  // Menu items use per-item cache (each item survives independently by hash).
-  // HUD items always render directly (refreshed every frame by ProcessSubtitles).
-  {
-    std::vector<DrawCommand> menuItems, hudItems;
-    for (auto &cmd : s_StageList) {
-      if (videoPlaying && !cmd.keepDuringVideo)
-        continue;
-      if (cmd.isMenuSource)
-        menuItems.push_back(std::move(cmd));
-      else
-        hudItems.push_back(std::move(cmd));
-    }
-    s_StageList.clear();
-
-    unsigned long now = GetTickCount();
-    const bool menuDiagActive =
-        inMenuContextGlobal && TextHook_IsMenuDiagActive();
-    const unsigned long long menuDiagSession =
-        menuDiagActive ? TextHook_GetMenuDiagSessionId() : 0ull;
-    const size_t cacheBeforeCount = s_MenuItemCache.size();
-    int transitionNewCount = -1;
-    bool transitionFlushed = false;
-
-    // Per-item menu cache with upsert + transition detection:
-    // - Each item is cached independently by (text + coarseY) hash.
-    // - Fresh items are upserted: existing entries updated, new entries added.
-    // - Items NOT in the current frame (alpha dip) persist from cache → no flicker.
-    // - Menu transition (>50% new items): flush old items first → no ghosting.
-    // - Stale items always expire after kMenuItemTTLMs → handles menu close.
-    if (!menuItems.empty()) {
-      // Precompute keys for fresh items
-      std::vector<uint64_t> freshKeys;
-      std::vector<uint64_t> freshPosKeys;
-      freshKeys.reserve(menuItems.size());
-      freshPosKeys.reserve(menuItems.size());
-      for (const auto &cmd : menuItems) {
-        freshKeys.push_back(MenuCmdHash(cmd.text, cmd.x, cmd.y,
-                                        menuMetrics.cacheBucketXPx,
-                                        menuMetrics.cacheBucketYPx));
-        freshPosKeys.push_back(MenuCmdPosHash(cmd.x, cmd.y,
-                                              menuMetrics.cacheBucketXPx,
-                                              menuMetrics.cacheBucketYPx));
-      }
-
-      // Transition detection: if majority of fresh items are NOT in cache,
-      // this is a menu transition → flush old items to prevent ghosting.
-      if (!s_MenuItemCache.empty()) {
-        std::unordered_set<uint64_t> cacheKeys;
-        cacheKeys.reserve(s_MenuItemCache.size() * 2 + 8);
-        for (const auto &c : s_MenuItemCache) {
-          cacheKeys.insert(c.key);
-        }
-
-        int newCount = 0;
-        for (auto fk : freshKeys) {
-          if (cacheKeys.find(fk) == cacheKeys.end()) {
-            ++newCount;
-          }
-        }
-        transitionNewCount = newCount;
-        if (newCount * 2 > (int)freshKeys.size()) {
-          transitionFlushed = true;
-          s_MenuItemCache.clear();
-        }
-      }
-
-      // Upsert: update existing items in-place, add new ones.
-      for (size_t i = 0; i < menuItems.size(); ++i) {
-        uint64_t key = freshKeys[i];
-        uint64_t posKey = freshPosKeys[i];
-        bool found = false;
-        for (auto &c : s_MenuItemCache) {
-          if (c.key == key) {
-            c.cmd = std::move(menuItems[i]);
-            c.posKey = posKey;
-            c.lastSeen = now;
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          // If text changed at the same coarse position, replace the old cache
-          // entry immediately (prevents 1-2 frame duplicate trails).
-          for (auto &c : s_MenuItemCache) {
-            if (c.posKey == posKey) {
-              c.key = key;
-              c.cmd = std::move(menuItems[i]);
-              c.posKey = posKey;
-              c.lastSeen = now;
-              found = true;
-              break;
-            }
-          }
-        }
-        if (!found) {
-          s_MenuItemCache.push_back({key, posKey, std::move(menuItems[i]), now});
-        }
-      }
-    }
-
-    // Always expire stale entries (runs every frame, not just when menuItems
-    // is empty — critical for menu-close cleanup and transition residue).
-    {
-      auto it = std::remove_if(s_MenuItemCache.begin(), s_MenuItemCache.end(),
-        [now](const CachedMenuCmd &c) { return (now - c.lastSeen) > kMenuItemTTLMs; });
-      s_MenuItemCache.erase(it, s_MenuItemCache.end());
-    }
-
-    // Build draw list: cached menu items + fresh HUD items.
-    s_DrawList.clear();
-    for (const auto &c : s_MenuItemCache)
-      s_DrawList.push_back(c.cmd);
-    for (auto &cmd : hudItems)
-      s_DrawList.push_back(std::move(cmd));
-
-    if (menuDiagActive) {
-      static unsigned long long s_LastMenuDiagRenderSession = 0;
-      static int s_MenuDiagRenderFrame = 0;
-      if (menuDiagSession != s_LastMenuDiagRenderSession) {
-        s_LastMenuDiagRenderSession = menuDiagSession;
-        s_MenuDiagRenderFrame = 0;
-      }
-      if (s_MenuDiagRenderFrame < 24) {
-        std::ostringstream fss;
-        fss << "[MENU-DIAG-FRAME] sess=" << menuDiagSession
-            << " frame=" << s_MenuDiagRenderFrame
-            << " fresh=" << menuItems.size()
-            << " hud=" << hudItems.size()
-            << " cacheBefore=" << cacheBeforeCount
-            << " cacheAfter=" << s_MenuItemCache.size()
-            << " draw=" << s_DrawList.size()
-            << " newCount=" << transitionNewCount
-            << " flushed=" << (transitionFlushed ? 1 : 0)
-            << " front=" << (TextHook_IsFrontendMenuLikely() ? 1 : 0)
-            << " menu=" << (TextHook_IsMenuContext() ? 1 : 0);
-        LogToFile(fss.str());
-
-        int freshLogged = 0;
-        for (size_t i = 0; i < menuItems.size() && freshLogged < 16; ++i) {
-          const auto &cmd = menuItems[i];
-          std::ostringstream oss;
-          oss << "[MENU-DIAG-FRESH] sess=" << menuDiagSession
-              << " frame=" << s_MenuDiagRenderFrame
-              << " idx=" << freshLogged
-              << " x=" << cmd.x
-              << " y=" << cmd.y
-              << " w=" << cmd.finalWidthEng
-              << " a=" << cmd.a
-              << " force=" << cmd.forceAlign
-              << " atlas=" << (unsigned int)cmd.atlasSlot
-              << " text=\"" << Utf8Preview(cmd.text, 64) << "\"";
-          LogToFile(oss.str());
-          ++freshLogged;
-        }
-
-        int drawLogged = 0;
-        for (size_t i = 0; i < s_DrawList.size() && drawLogged < 16; ++i) {
-          const auto &cmd = s_DrawList[i];
-          if (!cmd.isMenuSource)
-            continue;
-          std::ostringstream oss;
-          oss << "[MENU-DIAG-DRAW] sess=" << menuDiagSession
-              << " frame=" << s_MenuDiagRenderFrame
-              << " idx=" << drawLogged
-              << " x=" << cmd.x
-              << " y=" << cmd.y
-              << " w=" << cmd.finalWidthEng
-              << " a=" << cmd.a
-              << " force=" << cmd.forceAlign
-              << " atlas=" << (unsigned int)cmd.atlasSlot
-              << " text=\"" << Utf8Preview(cmd.text, 64) << "\"";
-          LogToFile(oss.str());
-          ++drawLogged;
-        }
-        ++s_MenuDiagRenderFrame;
-      }
-    }
+  // Publish whole engine frames, including empty ones. Present may run between
+  // individual AddCmd calls: it must never consume a partially built menu or
+  // resurrect hidden items through a time-based per-text cache.
+  s_DrawList.clear();
+  if (nativeBatch) {
+    s_DrawList = *nativeBatch;
+  } else {
+  if (s_MenuFrames.Available()) {
+    for (const auto &cmd : s_MenuFrames.Current())
+      if (!videoPlaying || cmd.keepDuringVideo) s_DrawList.push_back(cmd);
+  }
+  for (auto &cmd : s_StageList) {
+    if (videoPlaying && !cmd.keepDuringVideo) continue;
+    // Only an unavailable native capture uses the fresh legacy menu path.
+    if (cmd.isMenuSource && s_MenuFrames.Available()) continue;
+    s_DrawList.push_back(std::move(cmd));
+  }
+  s_StageList.clear();
   }
 
+  NativeMenuCapture::Trace(11, nullptr, (float)s_DrawList.size(), (float)s_MenuFrames.Current().size(), (float)s_MenuFrames.Available(), videoPlaying ? 1.0f : 0.0f);
   if (s_DrawList.empty())
     return;
 
@@ -1581,19 +1498,26 @@ void KoreanRenderer::Render() {
 
   // 2. Build Vertex Data
   D3D11_MAPPED_SUBRESOURCE mapped;
-  if (FAILED(s_pContext->Map(s_pVertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0,
+  size_t nativeVertexBudget = 0;
+  if (nativeBatch)
+    for (const auto &cmd : *nativeBatch)
+      nativeVertexBudget += cmd.text.size() * (cmd.glowA > 0 ? 72 : 12) + 32;
+  const bool smallNative = nativeBatch && s_pNativeVertexBuffer &&
+      nativeVertexBudget < kNativeRegionSize;
+  ID3D11Buffer *renderVertexBuffer = smallNative ? s_pNativeVertexBuffer : s_pVertexBuffer;
+  if (FAILED(s_pContext->Map(renderVertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0,
                              &mapped)))
     return;
 
   SimpleVertex *vPtr = (SimpleVertex *)mapped.pData;
-  constexpr int REGION_SIZE = 49152; // 196608 / 4
-  constexpr int MAIN0_START = 0;
-  constexpr int MAIN1_START = REGION_SIZE;
-  constexpr int GLOW0_START = REGION_SIZE * 2;
-  constexpr int GLOW1_START = REGION_SIZE * 3;
-  constexpr int BTN_START   = REGION_SIZE * 4; // 5th region: gamepad button glyphs
-  constexpr int MAIN_MAX = REGION_SIZE;
-  constexpr int GLOW_MAX = REGION_SIZE;
+  const int REGION_SIZE = smallNative ? kNativeRegionSize : 49152;
+  const int MAIN0_START = 0;
+  const int MAIN1_START = REGION_SIZE;
+  const int GLOW0_START = REGION_SIZE * 2;
+  const int GLOW1_START = REGION_SIZE * 3;
+  const int BTN_START   = REGION_SIZE * 4; // 5th region: gamepad button glyphs
+  const int MAIN_MAX = REGION_SIZE;
+  const int GLOW_MAX = REGION_SIZE;
   constexpr int BTN_MAX  = 512; // max ~85 button icons per frame
 
   SimpleVertex *mainPtr0 = vPtr + MAIN0_START;
@@ -2219,7 +2143,7 @@ void KoreanRenderer::Render() {
     // Menu alignment clustering must never touch HUD/video subtitle commands.
     // If this runs on subtitle readability passes, anchor quantization can
     // drift during loading/video and appear as left-offset blur growth.
-    if (!cmd.isMenuSource) {
+    if (!cmd.isMenuSource || cmd.nativeText.valid) {
       alignInfos[i].type = 0;      // Left
       alignInfos[i].anchorX = cmd.x;
       continue;
@@ -2763,16 +2687,16 @@ void KoreanRenderer::Render() {
     }
 
     s_QteScaleMode = cmd.qteScaleMode;
-    const float finalScale = CalculateFinalScale(
-        cmd.fontHeight, cmd.scale, cmd.resolutionScale);
+    float finalScale = cmd.nativeText.valid ? cmd.nativeText.scaleX :
+        CalculateFinalScale(cmd.fontHeight, cmd.scale, cmd.resolutionScale);
     s_QteScaleMode = false;
     const float effectiveGlobalOffset = menuMetrics.globalYOffsetPx;
     const float effectiveSmallOffset = menuMetrics.smallMenuYOffsetPx;
-    const float effectiveYOffset =
+    const float effectiveYOffset = cmd.nativeText.valid ? 0.0f :
         effectiveGlobalOffset + (cmd.isSmallMenu ? effectiveSmallOffset : 0.0f);
 
     const bool skipClipping =
-        !inMenuContextGlobal || !cmd.isMenuSource || friendsOverlayActive ||
+        cmd.nativeMenu || !inMenuContextGlobal || !cmd.isMenuSource || friendsOverlayActive ||
         cmd.skipMenuClipping;
 
     if (!skipClipping) {
@@ -2844,7 +2768,7 @@ void KoreanRenderer::Render() {
 
     // Mission Select detail title (center panel) should use header atlas.
     // Keep left mission list untouched by constraining to center-title band.
-    if (inMenuContextGlobal && missionSelectActive && cmd.isMenuSource) {
+    if (!cmd.nativeText.valid && inMenuContextGlobal && missionSelectActive && cmd.isMenuSource) {
       const std::string norm = replaceRegularWithNormal ? NormalizePopupText(renderText) : normCache[cmdIndex].normalized;
       const std::string upper = replaceRegularWithNormal ? ToUpperAsciiSimple(norm) : normCache[cmdIndex].upper;
       const float contentW = menuMetrics.contentRight - menuMetrics.contentLeft;
@@ -2925,6 +2849,20 @@ void KoreanRenderer::Render() {
                             : &glowCount0;
     const int atlasWidth = KoreanAtlas::GetAtlasWidth(renderAtlasSlot);
     const int atlasHeight = KoreanAtlas::GetAtlasHeight(renderAtlasSlot);
+    float nativeBaselineOffsetX = 0.0f;
+    if (cmd.nativeText.valid && cmd.nativeText.capBottom > cmd.nativeText.capTop) {
+      float inkTop, inkBottom;
+      if (KoreanAtlas::GetHangulBounds(renderAtlasSlot, inkTop, inkBottom)) {
+        float capTop = inkTop, capBottom = inkBottom;
+        KoreanAtlas::GetCapBounds(renderAtlasSlot, capTop, capBottom);
+        finalScale = cmd.nativeText.FontScaleX(capTop, capBottom);
+        nativeBaselineOffsetX = cmd.nativeText.BaselineOffsetX(inkTop, inkBottom, finalScale);
+      }
+    }
+
+    const float buttonHeight = cmd.nativeText.valid ?
+        cmd.nativeText.fontPixelHeight * cmd.nativeText.engineScaleX :
+        KoreanAtlas::GLYPH_SIZE_BASE * finalScale;
 
     // === ALIGNMENT APPLICATION ===
     int alignType = alignInfos[cmdIndex].type;
@@ -2953,6 +2891,11 @@ void KoreanRenderer::Render() {
         anchorX = cmd.x; // Left
     }
 
+    if (cmd.nativeText.valid) {
+      alignType = cmd.nativeText.alignment;
+      anchorX = cmd.nativeText.Anchor();
+    }
+
     // For fallback cases (single items), ensure anchor is correct
     if (alignType == 0 && anchorX == 0.0f)
       anchorX = cmd.x;
@@ -2971,7 +2914,7 @@ void KoreanRenderer::Render() {
     float maxWidth = (cmd.maxWidthPx > 1.0f) ? cmd.maxWidthPx
                                               : ((float)vp.Width * 0.95f);
 
-    if (!cmd.disableAutoWrap && popupActive && cmdIndex >= 0 &&
+    if (!cmd.nativeText.valid && !cmd.disableAutoWrap && popupActive && cmdIndex >= 0 &&
         cmdIndex < (int)popupMask.size() && popupMask[cmdIndex]) {
       maxWidth = (float)vp.Width * 0.65f;
     }
@@ -2985,7 +2928,7 @@ void KoreanRenderer::Render() {
       const std::string &otherNorm = normCache[NCIdx(other)].normalized;
       if (otherNorm == "알림") { hasNoticeHeader = true; break; }
     }
-    if (hasNoticeHeader) {
+    if (hasNoticeHeader && !cmd.nativeText.valid) {
       if (renderText.find("저장합니다") != std::string::npos &&
           renderText.find("전원을 끄지") != std::string::npos &&
           renderText.find('\n') == std::string::npos) {
@@ -3006,9 +2949,7 @@ void KoreanRenderer::Render() {
 
     if (cmd.disableAutoWrap) {
       lines.push_back(
-          {renderText, KoreanRenderer::MeasureTextWidthEx(renderText, cmd.fontHeight,
-                                                          cmd.scale, renderAtlasSlot,
-                                                          cmd.resolutionScale)});
+          {renderText, MeasureAtlasTextWidth(renderText, finalScale, renderAtlasSlot, buttonAtlas.get(), buttonHeight)});
     } else {
       std::string currentLine;
       float currentLineWidth = 0.0f;
@@ -3087,8 +3028,7 @@ void KoreanRenderer::Render() {
 
         // Button glyph control chars: advance by one button-size square
         if (cp >= 1 && cp <= 23) {
-          float btnSz = KoreanAtlas::GLYPH_SIZE_BASE * finalScale * 1.4f;
-          wordWidth += btnSz + KoreanAtlas::GLYPH_SIZE_BASE * finalScale * 1.4f * 0.08f;
+          wordWidth += GamepadGlyphAtlas::Advance(buttonAtlas.get(), cp, buttonHeight);
           continue;
         }
 
@@ -3127,7 +3067,9 @@ void KoreanRenderer::Render() {
       continue;
 
     // === RENDER LINES ===
-    float lineHeight = KoreanAtlas::GLYPH_SIZE_BASE * finalScale * 1.2f;
+    float lineHeight = cmd.nativeText.valid ?
+        cmd.nativeText.fontPixelHeight * cmd.nativeText.engineScaleX :
+        KoreanAtlas::GLYPH_SIZE_BASE * finalScale * 1.2f;
     float cursorY;
     if (cmd.yIsTopOfText) {
       // Caller passes Y as top-of-text (native engine convention for HUD).
@@ -3136,7 +3078,7 @@ void KoreanRenderer::Render() {
       cursorY = cmd.y + ascent;
     } else {
       // Legacy path: Y is approximate baseline, apply global menu offset.
-      cursorY = cmd.y + effectiveYOffset;
+      cursorY = cmd.y + effectiveYOffset + nativeBaselineOffsetX;
     }
 
     // Autosave body: nudge down by half a line to balance vertical space.
@@ -3146,6 +3088,7 @@ void KoreanRenderer::Render() {
 
     int &mainCount = *mainCountPtr;
     int &glowCount = *glowCountPtr;
+    const int firstMain = mainCount, firstGlow = glowCount, firstButton = btnCount;
 
     for (const auto &line : lines) {
       if (mainCount + 6 >= MAIN_MAX)
@@ -3291,23 +3234,24 @@ void KoreanRenderer::Render() {
         // ── Gamepad button glyph (codepoints 1–23) ───────────────────────────
         // Rendered using the captured game font atlas SRV via the btn region.
         if (cp >= 1 && cp <= 23) {
-          if (btnCount + 6 < BTN_MAX && GamepadGlyphAtlas::IsReady()) {
+          if (btnCount + 6 <= BTN_MAX && buttonAtlas) {
             GamepadGlyphAtlas::GlyphUV guv =
-                GamepadGlyphAtlas::GetGlyphUV((unsigned char)cp);
+                buttonAtlas->glyphs[cp];
             if (guv.valid) {
-              // Render as a 1.4x square, vertically centered on the text line
-              float lineH = KoreanAtlas::GLYPH_SIZE_BASE * finalScale;
-              float btnSz = lineH * 1.4f;
-              float bL    = cursorX;
-              float bT    = drawY - (btnSz - lineH) * 0.5f; // center on text line
-              float bR    = bL + btnSz;
-              float bB    = bT + btnSz;
+              // Preserve native bearings, rectangular stick icons, and advance.
+              const float lineH = buttonHeight;
+              const float baseline = cmd.nativeText.valid ?
+                  cursorY - nativeBaselineOffsetX : drawY + lineH * 0.85f;
+              const float bL = cursorX + guv.x * lineH;
+              const float bT = baseline + guv.y * lineH;
+              const float bR = bL + guv.width * lineH;
+              const float bB = bT + guv.height * lineH;
               float ndcL  = (bL / vp.Width)  * 2.0f - 1.0f;
               float ndcR  = (bR / vp.Width)  * 2.0f - 1.0f;
               float ndcT  = 1.0f - (bT / vp.Height) * 2.0f;
               float ndcB  = 1.0f - (bB / vp.Height) * 2.0f;
               // White vertex color — let the texture's full color show through
-              XMFLOAT4 white{curA, curA, curA, curA};
+              XMFLOAT4 white{1.0f, 1.0f, 1.0f, curA};
               // Triangle 1
               btnPtr[btnCount++] = {XMFLOAT2(ndcL,ndcT), white, XMFLOAT2(guv.s0,guv.t0)};
               btnPtr[btnCount++] = {XMFLOAT2(ndcR,ndcT), white, XMFLOAT2(guv.s1,guv.t0)};
@@ -3317,12 +3261,12 @@ void KoreanRenderer::Render() {
               btnPtr[btnCount++] = {XMFLOAT2(ndcR,ndcB), white, XMFLOAT2(guv.s1,guv.t1)};
               btnPtr[btnCount++] = {XMFLOAT2(ndcL,ndcB), white, XMFLOAT2(guv.s0,guv.t1)};
 
-              cursorX += btnSz + KoreanAtlas::GLYPH_SIZE_BASE * finalScale * 1.4f * 0.08f;
+              cursorX += GamepadGlyphAtlas::Advance(buttonAtlas.get(), cp, lineH);
               continue;
             }
           }
           // Atlas not ready or glyph missing — skip char silently
-          cursorX += KoreanAtlas::GLYPH_SIZE_BASE * finalScale * 1.4f * 0.6f;
+          cursorX += GamepadGlyphAtlas::Advance(buttonAtlas.get(), cp, buttonHeight);
           continue;
         }
 
@@ -3550,6 +3494,23 @@ void KoreanRenderer::Render() {
       cursorY += lineHeight;
 
     } // End Line Loop
+    NativeMenuCapture::Trace(12, cmd.text.c_str(), (float)mainCount, (float)glowCount, cmd.x, cmd.y);
+    if (cmd.nativeText.valid && cmd.nativeText.scaleX > 0) {
+      const float ratio = cmd.nativeText.scaleY / cmd.nativeText.scaleX;
+      const float baseline = 1.0f - cmd.y * 2.0f / vp.Height;
+      auto scaleVertical = [&](SimpleVertex *vertices, int first, int end) {
+        for (int v = first; v < end; ++v)
+          vertices[v].Pos.y = baseline + (vertices[v].Pos.y - baseline) * ratio;
+      };
+      scaleVertical(mainPtr, firstMain, mainCount);
+      scaleVertical(glowPtr, firstGlow, glowCount);
+      scaleVertical(btnPtr, firstButton, btnCount);
+    }
+    if (cmd.nativeMenu) {
+      ClipGeneratedQuads(mainPtr, firstMain, mainCount, cmd.menuClip, vp.Width, vp.Height);
+      ClipGeneratedQuads(glowPtr, firstGlow, glowCount, cmd.menuClip, vp.Width, vp.Height);
+      ClipGeneratedQuads(btnPtr, firstButton, btnCount, cmd.menuClip, vp.Width, vp.Height);
+    }
   } // End Command Loop
 
   if (inMenuContextGlobal) {
@@ -3621,7 +3582,7 @@ void KoreanRenderer::Render() {
     }
   }
 
-  s_pContext->Unmap(s_pVertexBuffer, 0);
+  s_pContext->Unmap(renderVertexBuffer, 0);
 
   // 3. Set States
   float blendFactor[] = {0, 0, 0, 0};
@@ -3647,7 +3608,7 @@ void KoreanRenderer::Render() {
   // 5. Set Input Assembly
   UINT stride = sizeof(SimpleVertex);
   UINT offset = 0;
-  s_pContext->IASetVertexBuffers(0, 1, &s_pVertexBuffer, &stride, &offset);
+  s_pContext->IASetVertexBuffers(0, 1, &renderVertexBuffer, &stride, &offset);
   s_pContext->IASetInputLayout(s_pInputLayout);
   s_pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
@@ -3681,7 +3642,7 @@ void KoreanRenderer::Render() {
 
   // Button glyph pass — drawn last (on top) using the game's font atlas SRV.
   if (btnCount > 0) {
-    ID3D11ShaderResourceView *btnSRV = GamepadGlyphAtlas::GetSRV();
+    ID3D11ShaderResourceView *btnSRV = buttonAtlas ? buttonAtlas->srv : nullptr;
     if (btnSRV) {
       s_pContext->PSSetShaderResources(0, 1, &btnSRV);
       s_pContext->OMSetBlendState(s_pBlendState, blendFactor, 0xFFFFFFFF);
@@ -3692,6 +3653,3 @@ void KoreanRenderer::Render() {
   // s_DrawList is NOT cleared here — retained for next frame if no new commands
   // arrive (prevents flicker when R_AddCmdDrawText fires intermittently).
 }
-
-
-

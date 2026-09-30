@@ -63,7 +63,7 @@ struct Font_s {
 inline int GetFontHeight(void *font) {
   if (!font) return 0;
   Font_s *f = reinterpret_cast<Font_s *>(font);
-  int h = f->fontHeight;
+  int h = f->glyphCount; // native pixelHeight at +8
   return (h >= 6 && h <= 200) ? h : 0;
 }
 
@@ -71,8 +71,8 @@ inline int GetFontHeight(void *font) {
 inline Glyph *FindGlyph(void *font, uint16_t codepoint) {
   if (!font) return nullptr;
   Font_s *f = reinterpret_cast<Font_s *>(font);
-  if (!f->glyphs || f->glyphCount <= 0) return nullptr;
-  for (int i = 0; i < f->glyphCount; i++) {
+  if (!f->glyphs || f->fontHeight <= 0 || f->fontHeight > 4096) return nullptr;
+  for (int i = 0; i < f->fontHeight; i++) {
     if (f->glyphs[i].letter == codepoint)
       return &f->glyphs[i];
   }

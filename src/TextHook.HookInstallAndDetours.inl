@@ -46,338 +46,8 @@ static bool IsProbablyExecutableCode(void *addr) {
 }
 
 
-// =============================================================================
-// CG_DrawHudElem Hook — enforces x=9999 for suppressed objective elements
-// BEFORE CG_DrawHudElem reads x into a local variable, eliminating the
-// per-frame race where the engine overwrites x between our Present writes.
-// The function runs normally (typewriter sounds play), just at x=9999.
-// =============================================================================
-static void *Original_CG_DrawHudElem = nullptr;
-static bool g_CG_DrawHudElem_Hooked = false;
-
-// Scan backward from a known address inside a function to find the function
-// start, identified by CC (int3) padding inserted by MSVC between functions.
-static uintptr_t ScanBackForFunctionStart(uintptr_t addrInsideFunction,
-                                          int maxScanBack = 0x1000) {
-  __try {
-    const unsigned char *p = (const unsigned char *)addrInsideFunction;
-    for (int i = 1; i < maxScanBack; i++) {
-      if (p[-i] == 0xCC && p[-i + 1] != 0xCC) {
-        return addrInsideFunction - i + 1;
-      }
-    }
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    // Memory access violation during scan
-  }
-  return 0;
-}
-
-// Identify which of RCX/RDX is the hudelem_s pointer by checking if it falls
-// within the known HudElem array region.  Returns 0 if neither matches.
-static uintptr_t IdentifyHudElemPtr(uintptr_t rcx, uintptr_t rdx) {
-  static const uintptr_t s_moduleBase = (uintptr_t)GetModuleHandleA(NULL);
-  const uintptr_t arrayBase =
-      s_moduleBase + IW6Offsets::HudElem_Array_SP;
-  const uintptr_t arrayEnd =
-      arrayBase +
-      (uintptr_t)IW6Offsets::HudElem_Array_Stride_SP * 2048;
-
-  uintptr_t params[2] = {rcx, rdx};
-  for (int i = 0; i < 2; i++) {
-    uintptr_t p = params[i];
-    if (p >= arrayBase && p < arrayEnd &&
-        ((p - arrayBase) % IW6Offsets::HudElem_Array_Stride_SP) == 0) {
-      return p;
-    }
-  }
-  return 0;
-}
-
-// Slot-reuse detection for timescript persist suppress.
-// Countdown timers use specific text configstring values at +0xA0.
-// If the HudElem's text configstring changes to a value outside this set,
-// the slot has been repurposed (e.g., for "File: gloaming.ogg" debug text).
-static bool IsKnownTimeScriptTextCfg(uint32_t textCfg) {
-  // Values observed at HudElem+0xA0 while the timer element is active.
-  // This whitelist prevents the text-based slot-reuse check from falsely
-  // deactivating suppress on the timer itself.  Slot reuse by non-timer
-  // elements (gauge bars, objectives) is caught by the LABEL check
-  // (originalLabel vs curLabel at +0x40), which is the primary guard.
-  return textCfg == 0 || textCfg == 0x11 || textCfg == 0x18 ||
-         textCfg == 0x1D || textCfg == 0x23 || textCfg == 0x24 ||
-         textCfg == 0x3B || textCfg == 0x3C;
-}
-
-void __fastcall Detour_CG_DrawHudElem(uintptr_t rcx, uintptr_t rdx,
-                                      uintptr_t r8, uintptr_t r9) {
-
-  // --- Identify hudelem_s pointer (always, not just when suppressing) ---
-  const uintptr_t elemPtr = IdentifyHudElemPtr(rcx, rdx);
-
-  // Cache native coordinates BEFORE any suppression writes x=9999.
-  if (elemPtr != 0) {
-    float ex = *(volatile float *)(elemPtr + 0x04);
-    float ey = *(volatile float *)(elemPtr + 0x08);
-    float fs = *(volatile float *)(elemPtr + 0x14);
-    if (std::isfinite(ex) && std::isfinite(ey) && std::isfinite(fs) &&
-        fs > 0.01f && fs < 6.0f &&
-        ex > -2000.0f && ex < 2000.0f &&
-        ey > -2000.0f && ey < 2000.0f) {
-      CgDrawHudElemCapture cap{};
-      cap.x = ex;
-      cap.y = ey;
-      cap.fontScale = fs;
-      cap.alignOrg = *(volatile uint32_t *)(elemPtr + 0x28);
-      cap.alignScreen = *(volatile uint32_t *)(elemPtr + 0x2C);
-      cap.colorPacked = *(volatile uint32_t *)(elemPtr + 0x30);
-      cap.tick = GetTickCount();
-      TextHook_StoreCgDrawElemPtrCapture(elemPtr, cap);
-    }
-  }
-
-  const bool hasObj =
-      g_hasObjSuppressed.load(std::memory_order_relaxed);
-  const bool hasTS = g_TimeScriptPersistSuppress.active;
-  // Detection alone must not hide the native digits. Wait until the overlay
-  // has a fresh, computed countdown (including its number).
-  const bool hasTimerReplacement =
-      hasTS && TextHook_HasTimeScriptTimerReplacement();
-
-  if (hasObj || hasTS) {
-    // --- Objective suppress: x = +9999 (scan rcx/rdx) ---
-    if (hasObj) {
-      uintptr_t params[2] = {rcx, rdx};
-      for (int pi = 0; pi < 2; pi++) {
-        uintptr_t ptr = params[pi];
-        if (ptr < 0x10000 || ptr >= 0x7FFFFFFFFFFF) continue;
-        std::lock_guard<std::mutex> lk(g_objSuppressMutex);
-        auto it = g_objSuppressedElems.find(ptr);
-        if (it != g_objSuppressedElems.end()) {
-          // Check freshness: only suppress if the objective renderer
-          // refreshed this entry recently.  Do NOT refresh the tick here
-          // — only the renderer should refresh.  This prevents stale
-          // entries from being kept alive when the game repurposes the
-          // HudElem slot for a different element (e.g., gauge bar).
-          if ((GetTickCount() - it->second.lastRefreshTick) > 2000) {
-            g_objSuppressedElems.erase(it);
-          } else {
-            const uint32_t liveXBits = *(volatile uint32_t *)(ptr + 0x04);
-            float liveX = 0.0f;
-            memcpy(&liveX, &liveXBits, sizeof(float));
-            if (std::isfinite(liveX) && liveX > -2000.0f && liveX < 2000.0f) {
-              it->second.currentXBits = liveXBits;
-            }
-            static const float kOff = 9999.0f;
-            uint32_t offBits;
-            memcpy(&offBits, &kOff, sizeof(uint32_t));
-            *(volatile uint32_t *)(ptr + 0x04) = offBits;
-          }
-          break;
-        }
-      }
-    }
-
-    // --- TimeScript suppress: x = +9999 (using canonical elemPtr) ---
-    if (hasTS && elemPtr != 0) {
-      static const float kOff = 9999.0f;
-      uint32_t offBits;
-      memcpy(&offBits, &kOff, sizeof(uint32_t));
-
-      if (elemPtr == g_TimeScriptPersistSuppress.elemPtr) {
-        uint32_t curText = *(volatile uint32_t *)(elemPtr + 0xA0);
-        uint32_t curLabel = *(volatile uint32_t *)(elemPtr + 0x40);
-
-        // Slot-reuse detection: deactivate suppress when the HudElem
-        // slot has been repurposed for a different element.
-        //
-        // Guard 1: original label changed.
-        // Guard 2: when we never recorded a label, fall back to the known
-        // +0xA0 timescript whitelist from the SSOT.  0x23/0x24/0x3B/0x3C can
-        // legitimately appear on timer HudElems, so we must only deactivate
-        // when +0xA0 is non-zero and outside that whitelist.
-        const bool labelKnown =
-            (g_TimeScriptPersistSuppress.originalLabel != 0);
-        const bool labelChanged =
-            labelKnown &&
-            curLabel != g_TimeScriptPersistSuppress.originalLabel;
-        const bool textReused =
-            !labelKnown &&
-            curText != 0 &&
-            !IsKnownTimeScriptTextCfg(curText);
-
-        if (labelChanged || textReused) {
-          g_TimeScriptPersistSuppress.active = false;
-          g_TimeScriptPersistSuppress.deactivatedElemPtr = elemPtr;
-          g_TimeScriptPersistSuppress.deactivatedTick = GetTickCount();
-          {
-            static DWORD s_lastDeactLog = 0;
-            DWORD _dnow = GetTickCount();
-            if ((_dnow - s_lastDeactLog) > 500) {
-              s_lastDeactLog = _dnow;
-              char _dm[256];
-              sprintf_s(_dm,
-                        "[TIMESCRIPT-SUPPRESS-DEACT] elemPtr=0x%llX "
-                        "labelChanged=%d textReused=%d curText=0x%X "
-                        "curLabel=0x%X origLabel=0x%X",
-                        (unsigned long long)elemPtr,
-                        labelChanged ? 1 : 0, textReused ? 1 : 0, curText,
-                        curLabel, g_TimeScriptPersistSuppress.originalLabel);
-              LogToFile(_dm);
-            }
-          }
-        } else if (hasTimerReplacement) {
-          // Suppress regardless of current type.  During SATFARM cutscenes
-          // the timer HudElem type switches from TIMER_DOWN(5) to TEXT(1)
-          // or TIMER_UP(4) for extended periods while the slot is still
-          // our timer.  Checking originalType here caused English to leak
-          // through for the entire cutscene duration.
-          *(volatile uint32_t *)(elemPtr + 0x04) = offBits;  // x=9999
-          g_TimeScriptPersistSuppress.lastSuppressTick = GetTickCount();
-        }
-      }
-      // Companion: timer-value HudElem sharing the same countdown end time.
-      else if (hasTimerReplacement &&
-               g_TimeScriptPersistSuppress.cachedTimeField > 30000) {
-        uint32_t timeField = *(volatile uint32_t *)(elemPtr + 0x78);
-        if (timeField == g_TimeScriptPersistSuppress.cachedTimeField) {
-          *(volatile uint32_t *)(elemPtr + 0x04) = offBits;  // x=9999
-        }
-      }
-      else {
-        // elemPtr doesn't match suppress target and no companion match.
-        // Log periodically to diagnose post-transition mismatch.
-        static DWORD s_lastMissLog = 0;
-        DWORD _tnow = GetTickCount();
-        if ((_tnow - s_lastMissLog) > 900) {
-          s_lastMissLog = _tnow;
-          char _mb[256];
-          sprintf_s(_mb, "[TIMESCRIPT-SUPPRESS-MISS] got=0x%llX "
-                    "want=0x%llX cachedTF=%u",
-                    (unsigned long long)elemPtr,
-                    (unsigned long long)g_TimeScriptPersistSuppress.elemPtr,
-                    g_TimeScriptPersistSuppress.cachedTimeField);
-          LogToFile(_mb);
-        }
-      }
-    }
-  }
-
-  // --- Label-based auto-registration for timer (즉시 이어하기 path) ---
-  // When IAR-DIRECT never fires (e.g., checkpoint load mid-cutscene),
-  // g_TimeScriptPersistSuppress is never activated.  Detect the timer
-  // HudElem by its label configstring and self-register so suppression
-  // applies even without an IAR-DIRECT scan.
-  // Only auto-register when suppression is completely inactive.  If
-  // g_TimeScriptPersistSuppress.active is already true (IAR-DIRECT ran and
-  // registered the correct elemPtr), never overwrite — another HudElem
-  // sharing the same label configstring would corrupt the established
-  // registration and break suppression for the whole session.
-  if (elemPtr != 0 && !g_TimeScriptPersistSuppress.active) {
-    // Cooldown: don't re-register the same elemPtr that was just deactivated
-    // due to slot reuse.  The stale timer type/label on the repurposed slot
-    // would cause a false re-registration loop.
-    const DWORD _cdNow = GetTickCount();
-    const bool inCooldown =
-        (g_TimeScriptPersistSuppress.deactivatedElemPtr == elemPtr &&
-         (_cdNow - g_TimeScriptPersistSuppress.deactivatedTick) < 5000);
-    if (inCooldown) {
-      static DWORD s_lastCdLog = 0;
-      if ((_cdNow - s_lastCdLog) > 2000) {
-        s_lastCdLog = _cdNow;
-        char _cdm[256];
-        sprintf_s(_cdm,
-                  "[TIMESCRIPT-COOLDOWN-BLOCK] autoreg blocked "
-                  "elemPtr=0x%llX age=%ums",
-                  (unsigned long long)elemPtr,
-                  _cdNow - g_TimeScriptPersistSuppress.deactivatedTick);
-        LogToFile(_cdm);
-      }
-      goto skip_auto_reg;
-    }
-    uint32_t label = 0;
-    bool isSatfarmLabel = false, isClockworkLabel = false;
-    if (TryReadIntroU32(elemPtr, 0x40, label)) {
-      isSatfarmLabel = (label == 0x3B || label == 0x3C);
-      // 0x23 is a low configstring index — require timer type to avoid
-      // false matches in non-CLOCKWORK missions.
-      if (label == 0x23) {
-        uint32_t eType = 0;
-        TryReadIntroU32(elemPtr, 0x00, eType);
-        isClockworkLabel = IsHudElemTimerType(eType);
-      }
-    }
-    if (isSatfarmLabel || isClockworkLabel) {
-      uint32_t curText = 0;
-      TryReadIntroU32(elemPtr, 0xA0, curText);
-      if (curText == 0 || IsKnownTimeScriptTextCfg(curText)) {
-        g_TimeScriptPersistSuppress.elemPtr = elemPtr;
-        g_TimeScriptPersistSuppress.originalLabel = label;
-        g_TimeScriptPersistSuppress.originalTextSlc = 0;
-        g_TimeScriptPersistSuppress.active = true;
-        g_TimeScriptPersistSuppress.lastSuppressTick = GetTickCount();
-        // Refresh cachedTimeField from HudElem+0x78
-        uint32_t tf = 0;
-        if (TryReadIntroU32(elemPtr, 0x78, tf) && tf > 30000) {
-          g_TimeScriptPersistSuppress.cachedTimeField = tf;
-        }
-        // Keep native digits while the newly registered timer is being found.
-        static const float kOff = 9999.0f;
-        uint32_t offBits;
-        memcpy(&offBits, &kOff, sizeof(uint32_t));
-        if (TextHook_HasTimeScriptTimerReplacement()) {
-          *(volatile uint32_t *)(elemPtr + 0x04) = offBits;
-        }
-
-        static DWORD s_lastAutoRegLog = 0;
-        DWORD _tnow = GetTickCount();
-        if ((_tnow - s_lastAutoRegLog) > 2000) {
-          s_lastAutoRegLog = _tnow;
-          char _mb[256];
-          sprintf_s(_mb,
-                    "[TIMESCRIPT-CG-AUTOREG] elemPtr=0x%llX label=0x%X "
-                    "tf=%u text=%u",
-                    (unsigned long long)elemPtr, label,
-                    g_TimeScriptPersistSuppress.cachedTimeField, curText);
-          LogToFile(_mb);
-        }
-      }
-    }
-  skip_auto_reg:;
-  }
-
-  // Cache every HudElem's coordinates by elemPtr so that SEH-based
-  // key resolution (which fires later, possibly from a non-CG_DrawHudElem
-  // caller) can still look up the real HudElem data.
-  if (elemPtr != 0) {
-    float ex = *(volatile float *)(elemPtr + 0x04);
-    float ey = *(volatile float *)(elemPtr + 0x08);
-    float fs = *(volatile float *)(elemPtr + 0x14);
-    if (std::isfinite(ex) && std::isfinite(ey) && std::isfinite(fs) &&
-        fs > 0.01f && fs < 6.0f &&
-        ex > -2000.0f && ex < 2000.0f &&
-        ey > -2000.0f && ey < 2000.0f) {
-      CgDrawHudElemCapture cap{};
-      cap.x = ex;
-      cap.y = ey;
-      cap.fontScale = fs;
-      cap.alignOrg = *(volatile uint32_t *)(elemPtr + 0x28);
-      cap.alignScreen = *(volatile uint32_t *)(elemPtr + 0x2C);
-      cap.colorPacked = *(volatile uint32_t *)(elemPtr + 0x30);
-      cap.tick = GetTickCount();
-      TextHook_StoreCgDrawElemPtrCapture(elemPtr, cap);
-    }
-  }
-
-  // Set context BEFORE calling original — SEH hook reads this inside.
-  g_CGDrawHudElem_ElemPtr.store(elemPtr, std::memory_order_release);
-
-  // Call original — runs fully (sounds, animations), just offscreen if suppressed.
-  ((void(__fastcall *)(uintptr_t, uintptr_t, uintptr_t,
-                       uintptr_t))Original_CG_DrawHudElem)(rcx, rdx, r8, r9);
-
-  // Clear context after return.
-  g_CGDrawHudElem_ElemPtr.store(0, std::memory_order_release);
-}
+// Final native draw interception; no HudElem coordinate mutation.
+#include "TextHook.NativeHudCaption.inl"
 
 static bool ParseEnvFlag(const char *name, bool defaultValue = false) {
   char raw[32] = {0};
@@ -946,36 +616,13 @@ void __fastcall Detour_CG_GameMessage(int localClientNum, const char *message) {
 // =============================================================================
 
 unsigned int __fastcall Detour_ConfigString_IndexToSlc(unsigned int queryIdx) {
+  TextPerf::Hit(TextPerf::CfgCalls);
 
   if (!Original_ConfigString_IndexToSlc) {
     return 0;
   }
 
   const unsigned int slcIdx = Original_ConfigString_IndexToSlc(queryIdx);
-
-  // Credits guard + burst throttle: skip the expensive OBJECTIVE_REVERSE
-  // processing when credits are active, or when call volume is abnormally
-  // high (credits init causes 29K+ calls/frame vs normal ~50-100).
-  // The burst throttle catches the initial explosion BEFORE the credits
-  // guard activates via "ui_play_credits" SLC detection.
-  {
-    extern std::atomic<bool> g_creditsGuardActive;
-    if (g_creditsGuardActive.load(std::memory_order_relaxed)) {
-      return slcIdx;
-    }
-    // Burst throttle: 200ms window, 3000 call budget.
-    // Normal gameplay: ~600 calls/200ms.  Credits: 300K+/200ms.
-    static std::atomic<uint32_t> s_burstCount{0};
-    static std::atomic<DWORD> s_burstTick{0};
-    DWORD now = GetTickCount();
-    if ((now - s_burstTick.load(std::memory_order_relaxed)) > 200) {
-      s_burstCount.store(0, std::memory_order_relaxed);
-      s_burstTick.store(now, std::memory_order_relaxed);
-    }
-    if (s_burstCount.fetch_add(1, std::memory_order_relaxed) > 3000) {
-      return slcIdx;
-    }
-  }
 
 #if GHOSTSKOR_OBJECTIVE_REVERSE
   if (slcIdx != 0) {
@@ -985,6 +632,10 @@ unsigned int __fastcall Detour_ConfigString_IndexToSlc(unsigned int queryIdx) {
         (retAddr >= moduleBase) ? (retAddr - moduleBase) : 0;
     const bool isBroadCfgProducerCaller =
         ObjRev_IsBulkCfgProducerCaller(callerOffset);
+    // Bulk VM config walkers cannot establish HUD authority. Do not populate
+    // reverse maps for every script string, or throttle real HUD events by volume.
+    if (isBroadCfgProducerCaller) return slcIdx;
+    TextPerf::Hit(TextPerf::CfgAnalyzed);
     const DWORD now = GetTickCount();
 
     // Root-fix path: capture raw query->slc provenance first.
@@ -1302,6 +953,7 @@ void __fastcall Detour_Cbuf_AddText(int localClientNum, const char *text) {
 }
 
 const char *__fastcall Detour_SL_ConvertToString(unsigned int stringValue) {
+  TextPerf::Hit(TextPerf::SlcCalls);
 
   // --- Reimplemented original logic (no gateway call) ---
   if (stringValue == 0)
@@ -1365,21 +1017,6 @@ const char *__fastcall Detour_SL_ConvertToString(unsigned int stringValue) {
     }
   }
 
-  if (result && strcmp(result, "ui_play_credits") == 0) {
-    extern std::atomic<bool> g_creditsSoftGuard;
-    extern std::atomic<bool> g_creditsGuardActive;
-    // Soft guard: disable SLC only.  IntroTextLayout (still active) will
-    // determine credits vs gameplay and either upgrade to full guard or cancel.
-    if (!g_creditsSoftGuard.load(std::memory_order_relaxed) &&
-        !g_creditsGuardActive.load(std::memory_order_relaxed)) {
-      g_creditsSoftGuard.store(true, std::memory_order_relaxed);
-      TextHook_ClearHudNativeEntries();
-      TextHook_SoftSuspendSLC();
-      LogToFile("[CREDITS-GUARD] SOFT — ui_play_credits detected");
-    }
-  }
-
-
   // --- Caller capture (lightweight, throttled) ---
   // Only do work if string looks meaningful (>5 chars)
   if (!result || !result[0])
@@ -1390,14 +1027,19 @@ const char *__fastcall Detour_SL_ConvertToString(unsigned int stringValue) {
       result[4] == '\0' || result[5] == '\0')
     return result;
 
-  // Credits guard: skip all expensive SLC processing (objective authority,
-  // HUD key detection, NHUD param capture) while credits are active.
-  {
-    extern std::atomic<bool> g_creditsGuardActive;
-    if (g_creditsGuardActive.load(std::memory_order_relaxed)) {
-      return result;
-    }
-  }
+  const bool trustedHudCaller = ObjRev_IsObjectiveAuthoritySlcCaller(callerOffset) ||
+      // 232540 resolves the current HudElem text config through 273760,
+      // which tail-calls SLC. This is a native display call, even when its
+      // input is a localized-message stream or already-resolved English.
+      (NativeHudContext::Get() != 0 &&
+       callerOffset == IW6Offsets::Profile::Rva_232562) ||
+      callerOffset == IW6Offsets::Profile::Rva_3720F2 ||
+      callerOffset == IW6Offsets::Profile::Rva_2454FC ||
+      callerOffset == IW6Offsets::Profile::Rva_369002;
+  if (!TextIntakePolicy::ShouldInspectSlc(result,
+          NativeHudContext::Get() != 0, trustedHudCaller)) return result;
+  if (TextHook_UsesNativeBindingPrompt(result) || TextHook_UsesNativeHudCaption(result)) return result;
+  TextPerf::Hit(TextPerf::SlcAnalyzed);
 
 #if GHOSTSKOR_OBJECTIVE_REVERSE
   const DWORD now = GetTickCount();
@@ -2306,6 +1948,7 @@ const char *__fastcall Detour_SL_ConvertToString(unsigned int stringValue) {
   }
 #endif
 
+#if GHOSTSKOR_RUNTIME_DIAG
   // --- Deduplicated caller logging ---
   // Track unique callers with hit counts. Log first 5 hits per caller.
   {
@@ -2356,6 +1999,8 @@ const char *__fastcall Detour_SL_ConvertToString(unsigned int stringValue) {
       }
     }
   }
+
+#endif
 
   // --- HUD KEY NAME pattern detection ---
   // Detect localization key names resolved via SLC (e.g., "GAME_GET_TO_COVER")
@@ -2466,16 +2111,6 @@ const char *__fastcall Detour_SL_ConvertToString(unsigned int stringValue) {
     // SLC param probe flooding and false HUD rendering during credits.
     if (isCreditsKey) {
       isHudKey = false;
-    }
-    // Credits guard: suppress ALL HUD/objective intake while credits are
-    // active.  Without this, non-CREDITS_ keys (e.g. GAME_GET_TO_COVER)
-    // still enter the pipeline via R_AddCmdDrawText during credits,
-    // causing false HUDHINT entries and wasted CPU.
-    {
-      extern std::atomic<bool> g_creditsGuardActive;
-      if (g_creditsGuardActive.load(std::memory_order_relaxed)) {
-        isHudKey = false;
-      }
     }
     if (isHudKey) {
       if (!canonicalKey.empty() && !LooksLikeHudLocalizationKey(canonicalKey)) {
@@ -4685,10 +4320,70 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
   if (!text)
     return;
 
+  // Source is thread-local: Present's HUD/video queue cannot retag menu text.
+  // Include early menu paths (e.g. Rorke body), with restoration on every return.
+  extern thread_local std::atomic<bool> g_bQueueFromMenu;
+  NativeMenuCapture::Trace(7, text, x, y, xScale, yScale);
+  struct MenuSourceScope {
+    bool previous;
+    MenuSourceScope() : previous(g_bQueueFromMenu.exchange(NativeMenuCapture::IsFrameActive())) {}
+    ~MenuSourceScope() { g_bQueueFromMenu.store(previous); }
+  } menuSourceScope;
+  NativeMenuCapture::TextScope nativeTextScope(text, maxChars, font, x, y, xScale, yScale);
+  if(NativeMenuCapture::CurrentText().valid)
+    NativeMenuCapture::TraceSource(2, text, nullptr, nullptr, maxChars, x, y);
+  if (TextHook_UsesNativeGameplayText() && !NativeMenuCapture::CurrentText().valid &&
+      (NativeHudCaption::OwnsHudDraw() || !NativeHudCaption::IsDialogue(text))) {
+    bool dialogue=false;
+    if (!NativeHudCaption::OwnsHudDraw()) {
+      std::shared_lock<std::shared_mutex> lock(g_SubtitleMapMutex);
+      dialogue=g_SubtitleOnlyMap.count(NormalizeEnglishKey(text))!=0;
+    }
+    if (!dialogue) {
+      NativeHudCaption::Plain(text,maxChars,font,x,y,xScale,yScale,rotation,color,style);
+      return;
+    }
+  }
+  NativeMenuDraw::TextScope orderedTextScope(
+      reinterpret_cast<NativeMenuDraw::Producer>(Original_R_AddCmdDrawText),
+      font, x, y, xScale, yScale, rotation, style, NativeMenuCapture::CurrentText().valid);
+
+  // Preserve the owner of multiline and concatenated LUI messages. AddCmd's
+  // later wrapped lines belong to the same element invocation.
+  // No popup keywords, screen bands, timers, or cross-element deduplication.
+  if (NativeMenuDraw::IsCapturing() && KoreanRenderer::s_bInitialized) {
+    auto *run = NativeMenuCapture::CurrentTextRun();
+    if (run && (run->joinedLiterals || run->IsMultiline())) {
+      if (run->claimed) return;
+      EnsureTranslationsLoaded();
+      std::string sourceKey;
+      if (run->joinedLiterals) {
+        // Use only a literal translation of the complete joined message.
+        // Do not let an alias for one visual line select a longer warning,
+        // and do not change the key preference of ordinary menu labels.
+        sourceKey = NormalizeForMatching(*run->source);
+      } else {
+        const auto found = g_EnglishToKey.find(ToUpper(*run->source));
+        if (found != g_EnglishToKey.end()) sourceKey = found->second;
+      }
+      if (!sourceKey.empty()) {
+        const auto kor = g_KeyToKorean.find(sourceKey);
+        if (kor != g_KeyToKorean.end() && ContainsKorean(kor->second.c_str())) {
+          NativeMenuCapture::TraceSource(3, run->source->c_str(), kor->second.c_str(), sourceKey.c_str(), maxChars, x, y);
+          run->Claim();
+          const auto layout = NativeMenuCapture::CurrentText();
+          KoreanRenderer::QueueText(kor->second, x, y, xScale, color,
+              layout.fontPixelHeight, style, layout.width, false, false, xScale);
+          return;
+        }
+      }
+    }
+  }
+
   // ── Gamepad glyph atlas capture (runs once, no-op afterwards) ────────────
   // When the game renders text containing control chars \x01–\x17 (button
   // glyphs), capture the font material SRV + glyph UVs for inline rendering.
-  if (font && !GamepadGlyphAtlas::IsReady()) {
+  if (font) { // Re-evaluate controller family when the engine emits pad glyphs.
     for (const char *p = text; *p; ++p) {
       unsigned char c = (unsigned char)*p;
       if (c >= 1 && c <= 23) {
@@ -4849,7 +4544,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
               maxW);               // maxWidthPx for word wrap
 
           // Piggyback: re-QueueText cached header (prevents blink during hidden phase)
-          if (s_rkHdrCacheValid && !s_rkHdrCachedText.empty()) {
+          if (!NativeMenuCapture::IsFrameActive() && s_rkHdrCacheValid && !s_rkHdrCachedText.empty()) {
             KoreanRenderer::QueueText(
                 s_rkHdrCachedText, s_rkHdrX, s_rkHdrY,
                 s_rkHdrScaleAdj, s_rkHdrColor, s_rkHdrFontH,
@@ -5058,7 +4753,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
   }
 #endif
 
-  // --- [1] Ghost Text Suppression (Houston subtitle in menu) ---
+  // Legacy menu state used below by non-native fallback layouts.
   // Raw legacy flags were unverified. Menu keywords below establish state.
   auto IsMenuActive = []() -> bool { return false; };
 
@@ -5309,15 +5004,8 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
   // Some center gameplay hints (notably CORNERED_BINOCULARS_* Press/Hold lines)
   // are drawn through AddCmd instead of HUD_DrawText560.
   // We capture params here for alignment only; this does NOT alter menu draw flow.
-  if (TextHook_IsHudNativeEnabled()) {
-    // Credits guard: credits text must not enter HUD tail-capture state —
-    // prevents false-positive objective/hint overlays and avoids per-call
-    // processing overhead for the credit-roll draw flood.
-    do {
-    { extern std::atomic<bool> g_creditsGuardActive;
-      extern std::atomic<bool> g_creditsSoftGuard;
-      if (g_creditsGuardActive.load(std::memory_order_relaxed) ||
-          g_creditsSoftGuard.load(std::memory_order_relaxed)) break; }
+  if (!TextHook_UsesNativeGameplayText() && TextHook_IsHudNativeEnabled()) {
+
     static uintptr_t s_modBase = (uintptr_t)GetModuleHandleA(NULL);
     static std::mutex s_addcmdCallerMtx;
     static std::unordered_set<uintptr_t> s_trustedHudCallers = {IW6Offsets::Profile::Rva_27DF17};
@@ -5422,14 +5110,8 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
 
     const bool looksPromptLike = LooksLikePressHoldPrompt(rawText);
     const bool looksHudKeyLike = LooksLikeHudLocalizationKey(rawText);
-    // Credits guard: skip AddCmd HUD key processing during credits.
-    bool addcmdCreditsGuarded = false;
-    {
-      extern std::atomic<bool> g_creditsGuardActive;
-      addcmdCreditsGuarded =
-          g_creditsGuardActive.load(std::memory_order_relaxed);
-    }
-    if (!addcmdCreditsGuarded && (looksPromptLike || looksHudKeyLike)) {
+    // Process only strings classified as gameplay prompts/keys.
+    if (looksPromptLike || looksHudKeyLike) {
       EnsureTranslationsLoaded();
       std::string hudKey;
       bool resolved = ResolveKeyFromEnglishInternal(rawText, hudKey);
@@ -5616,7 +5298,6 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
         }
       }
     }
-    } while (0); // credits-break end
   }
 
   // Gameplay HUD hints/objhudhints are rendered by dedicated overlay pipelines.
@@ -5658,44 +5339,6 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
     return;
   }
 
-  // Suppress Houston/Picking subtitles in menu context
-  if (text[0] == 'P' || text[0] == 'H') {
-    if (strstr(text, "Houston") || strstr(text, "Picking it up")) {
-      // Suppress if memory flags OR in menu context
-      if (IsMenuActive() || s_InMenu)
-        return;
-    }
-  }
-
-  // Suppress Clockwork Kick subtitle in menu context (Korean/English text)
-  if (IsMenuActive() || s_InMenu) {
-    std::string cleanMenuText = StripColorCodes(std::string(text));
-    if (cleanMenuText.find("Kick:") != std::string::npos &&
-        cleanMenuText.find("Blackbird") != std::string::npos &&
-        (cleanMenuText.find("ten minutes") != std::string::npos ||
-         cleanMenuText.find("ten minute") != std::string::npos)) {
-      return;
-    }
-  }
-
-  // Suppress specific subtitle key in menu context
-  if (IsMenuActive() || s_InMenu) {
-    std::string cleanMenuText = StripColorCodes(std::string(text));
-    std::string upperMenuText = ToUpper(cleanMenuText);
-    auto itKey = g_EnglishToKey.find(upperMenuText);
-    if (itKey != g_EnglishToKey.end() &&
-        itKey->second == "SUBTITLE_CLOCKWORK_DIZ_NORTHERNRIDGE32") {
-      return;
-    }
-    // Fallback: suppress by matching the English subtitle sentence
-    if (cleanMenuText.find("Kick:") != std::string::npos &&
-        (cleanMenuText.find("ten minutes") != std::string::npos ||
-         cleanMenuText.find("ten minute") != std::string::npos) &&
-        cleanMenuText.find("Blackbird") != std::string::npos) {
-      return;
-    }
-  }
-
   // === DEBUG: Log ORIGINAL English text style BEFORE translation ===
   static int origStyleLogCount = 0;
   if (origStyleLogCount < 100) {
@@ -5713,12 +5356,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
   }
 
   // === TRANSLATION LOGIC (ALWAYS RUNS) ===
-  // Credits guard for translation block: credits strings are never in
-  // localize.json, so skip expensive O(N) fallback loops during credits.
-  const bool translationCreditsGuarded = []() -> bool {
-    extern std::atomic<bool> g_creditsGuardActive;
-    return g_creditsGuardActive.load(std::memory_order_relaxed);
-  }();
+
   const char *translated = text;
   const char *korean = nullptr;
   std::string translatedKey;
@@ -5812,9 +5450,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
     }
 
     // Fallback: SEH overlay map (runtime-discovered variants, append-only)
-    // Credits guard: credits strings are never in the overlay map, so skip
-    // the entire section (lock + O(N) prefix scan) when credits are active.
-    if (!korean && !translationCreditsGuarded) {
+    if (!korean) {
       std::shared_lock<std::shared_mutex> lock(g_OverlayMapMutex);
       std::string cleanText = StripColorCodes(std::string(text));
       std::string upperText = ToUpper(cleanText);
@@ -5935,10 +5571,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
     } // end if (!korean) fallback to overlay map
 
     // If not found in overlay map, try the static translation lookup.
-    // Credits guard: FindTranslation has O(N) fallback loops (g_BindingTemplates,
-    // g_PrefixToKey, g_RuntimeBindingTemplateToKey).  Credits strings never
-    // resolve there, so skip during credits to avoid pure overhead.
-    if (!korean && !translationCreditsGuarded) {
+    if (!korean) {
       korean = FindTranslation(text);
     }
     if (!korean && text) {
@@ -5985,6 +5618,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
     }
   }
 
+  NativeMenuCapture::TraceSource(4, text, korean, translatedKey.c_str(), maxChars, x, y);
   if (korean) {
     // Handle \n in Korean translation.
     // For multi-line body text in menus (e.g. Rorke Files), PRESERVE \n
@@ -6093,175 +5727,16 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
     }
   }
 
-  // Controls keybind value strings are runtime text and may bypass dictionary
-  // mapping entirely. Promote them before translationChanged gating, but only
-  // inside controls keybind pages to avoid false positives in mission menus.
-  static DWORD s_ControlBindMoveHeaderTick = 0;
-  static DWORD s_ControlBindActionHeaderTick = 0;
-  static DWORD s_ControlBindLookHeaderTick = 0;
-  static DWORD s_ControlBindChatHeaderTick = 0;
-  constexpr DWORD kControlBindContextWindowMs = 1200;
-  if (!textAlreadyKorean && text) {
-    const std::string bindProbe = NormalizeMenuText(std::string(text));
-    const std::string bindProbeUpper = ToUpperAscii(bindProbe);
-    const float bindScreenW = GetScreenWidthApprox();
-    const float bindScreenH = GetScreenHeightApprox();
-    const bool inControlHeaderBand =
-        (bindScreenW > 0.0f && bindScreenH > 0.0f &&
-         x <= bindScreenW * 0.30f && y <= bindScreenH * 0.16f);
-    if (inControlHeaderBand) {
-      if (bindProbe == "이동" || bindProbeUpper == "MOVE" ||
-          bindProbeUpper == "MOVEMENT") {
-        s_ControlBindMoveHeaderTick = nowMenu;
-      } else if (bindProbe == "동작" || bindProbeUpper == "ACTION" ||
-                 bindProbeUpper == "ACTIONS") {
-        s_ControlBindActionHeaderTick = nowMenu;
-      } else if (bindProbe == "시선" || bindProbeUpper == "LOOK" ||
-                 bindProbeUpper == "VIEW") {
-        s_ControlBindLookHeaderTick = nowMenu;
-      } else if (bindProbe == "채팅" || bindProbeUpper == "CHAT") {
-        s_ControlBindChatHeaderTick = nowMenu;
-      }
-    }
-
-    const bool inControlBindContext =
-        (s_ControlBindMoveHeaderTick != 0 &&
-         (nowMenu - s_ControlBindMoveHeaderTick) < kControlBindContextWindowMs) ||
-        (s_ControlBindActionHeaderTick != 0 &&
-         (nowMenu - s_ControlBindActionHeaderTick) < kControlBindContextWindowMs) ||
-        (s_ControlBindLookHeaderTick != 0 &&
-         (nowMenu - s_ControlBindLookHeaderTick) < kControlBindContextWindowMs) ||
-        (s_ControlBindChatHeaderTick != 0 &&
-         (nowMenu - s_ControlBindChatHeaderTick) < kControlBindContextWindowMs);
-    const bool inBindValueBand =
-        (bindScreenW > 0.0f && bindScreenH > 0.0f &&
-         x >= bindScreenW * 0.24f && x <= bindScreenW * 0.72f &&
-         y >= bindScreenH * 0.16f && y <= bindScreenH * 0.92f);
-
-    auto IsSimpleBindTokenUpper = [](const std::string &u) -> bool {
-      if (u.empty()) {
-        return false;
-      }
-      if (u == "SPACE" || u == "CTRL" || u == "SHIFT" || u == "ALT" ||
-          u == "TAB" || u == "ENTER" || u == "ESC" || u == "INS" ||
-          u == "DEL" || u == "PGUP" || u == "PGDN" || u == "HOME" ||
-          u == "END" || u == "MOUSE1" || u == "MOUSE2" || u == "MOUSE3" ||
-          u == "MWHEELUP" || u == "MWHEELDOWN") {
-        return true;
-      }
-      if (u.size() == 1 && std::isalnum((unsigned char)u[0])) {
-        return true;
-      }
-      if (u.size() >= 2 && u.size() <= 4 && u[0] == 'F') {
-        bool allDigits = true;
-        for (size_t i = 1; i < u.size(); ++i) {
-          if (!std::isdigit((unsigned char)u[i])) {
-            allDigits = false;
-            break;
-          }
-        }
-        if (allDigits) {
-          return true;
-        }
-      }
-      return false;
-    };
-
-    auto IsCompositeBindValueUpper = [&](const std::string &u) -> bool {
-      if (u.find(" OR ") == std::string::npos &&
-          u.find(" KEY_OR ") == std::string::npos &&
-          u.find(" 또는 ") == std::string::npos) {
-        return false;
-      }
-      auto TrimAsciiToken = [](const std::string &s) -> std::string {
-        size_t b = 0;
-        while (b < s.size() && std::isspace((unsigned char)s[b])) {
-          ++b;
-        }
-        size_t e = s.size();
-        while (e > b && std::isspace((unsigned char)s[e - 1])) {
-          --e;
-        }
-        return s.substr(b, e - b);
-      };
-      auto FindDelimiter = [&](size_t from, size_t &delimLen) -> size_t {
-        delimLen = 0;
-        size_t dOr = u.find(" OR ", from);
-        size_t dKeyOr = u.find(" KEY_OR ", from);
-        size_t dKor = u.find(" 또는 ", from);
-        size_t d = std::string::npos;
-        if (dOr != std::string::npos) {
-          d = dOr;
-        }
-        if (dKeyOr != std::string::npos &&
-            (d == std::string::npos || dKeyOr < d)) {
-          d = dKeyOr;
-        }
-        if (dKor != std::string::npos &&
-            (d == std::string::npos || dKor < d)) {
-          d = dKor;
-        }
-        if (d == dOr) {
-          delimLen = 4;
-        } else if (d == dKeyOr || d == dKor) {
-          delimLen = 8;
-        }
-        return d;
-      };
-
-      size_t delimLenProbe = 0;
-      if (FindDelimiter(0, delimLenProbe) == std::string::npos ||
-          delimLenProbe == 0) {
-        return false;
-      }
-
-      size_t pos = 0;
-      size_t parts = 0;
-      while (pos <= u.size()) {
-        size_t delimLen = 0;
-        size_t d = FindDelimiter(pos, delimLen);
-        std::string part =
-            (d == std::string::npos) ? u.substr(pos) : u.substr(pos, d - pos);
-        part = TrimAsciiToken(part);
-        if (part.empty()) {
-          return false;
-        }
-        const bool partIsBind =
-            IsSimpleBindTokenUpper(part) || part.rfind("KEY_", 0) == 0 ||
-            part.find("MOUSE") != std::string::npos ||
-            part.find("WHEEL") != std::string::npos;
-        if (!partIsBind) {
-          return false;
-        }
-        ++parts;
-        if (d == std::string::npos) {
-          break;
-        }
-        pos = d + delimLen;
-      }
-      return parts >= 2;
-    };
-
-    const bool looksLikeBindValue =
-        (bindProbe.find("할당되지 않음") != std::string::npos ||
-         bindProbe.find("마우스") != std::string::npos ||
-         IsCompositeBindValueUpper(bindProbeUpper) ||
-         bindProbeUpper.find("MOUSE") != std::string::npos ||
-         bindProbeUpper.find("WHEEL") != std::string::npos ||
-         bindProbeUpper.find("NOT BOUND") != std::string::npos ||
-         bindProbeUpper.find("UNBOUND") != std::string::npos ||
-         bindProbeUpper.rfind("KEY_", 0) == 0 ||
-         IsSimpleBindTokenUpper(bindProbeUpper));
-
-    if (inControlBindContext && inBindValueBand && looksLikeBindValue) {
-      std::string localizedBind =
-          BindingResolver::LocalizeBindingDisplayText(bindProbe, true);
-      if (!localizedBind.empty() && localizedBind != bindProbe) {
-        static std::string s_ControlBindForcedText;
-        s_ControlBindForcedText = localizedBind;
-        translated = s_ControlBindForcedText.c_str();
-        korean = translated;
-      }
+  // Runtime key values belong to the current LUI text element. The strict
+  // physical-key parser handles one or two assigned keys without header
+  // timers or screen-coordinate bands, at any aspect ratio.
+  std::string nativeBindingDisplay;
+  if (!textAlreadyKorean && text && NativeMenuCapture::CurrentText().valid) {
+    nativeBindingDisplay=BindingResolver::LocalizeNativeBindingDisplay(
+        NormalizeMenuText(std::string(text)));
+    if (!nativeBindingDisplay.empty() && ContainsKorean(nativeBindingDisplay.c_str())) {
+      translated=nativeBindingDisplay.c_str();
+      korean=translated;
     }
   }
   if (text) {
@@ -6536,7 +6011,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
       friendsMenuActive = true;
     }
   }
-  if (friendsMenuActive) {
+  if (friendsMenuActive && !NativeMenuCapture::IsFrameActive()) {
     translated = text;
     goto render_original;
   }
@@ -6634,7 +6109,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
 
   // If we found a translation, suppress original and queue overlay
   if (translationChanged || needsKoreanOverlay) {
-    // === CONTEXT DETECTION (for Houston suppression) ===
+    // Legacy menu context detection.
     static DWORD s_LastMenuTime = 0;
     bool isMenuElement = false;
 
@@ -6652,8 +6127,9 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
     bool menuContext =
         s_InMenu || isMenuElement || IsKoreanMenuText(text);
 
-    // Popup-only translation: when a center popup is active, keep outside text in English.
-    if (menuContext) {
+    // Only the legacy post-Present fallback needs popup guesses. Ordered
+    // native text is covered/dimmed by the real popup and stays translated.
+    if (menuContext && !NativeMenuDraw::IsCapturing()) {
       static std::atomic<DWORD> s_LastPopupStrongHeaderTime{0};
       static std::atomic<DWORD> s_LastPopupYesNoTime{0};
       static std::atomic<DWORD> s_LastPopupQuestionTime{0};
@@ -6970,25 +6446,6 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
             translated = text;
             goto render_original;
           }
-        }
-      }
-    }
-
-    // === TARGETED SUPPRESSION (Houston subtitle in menu) ===
-    if (translated) {
-      if (strstr(translated, "Houston") ||
-          strstr(translated, "\xED\x9C\xB4\xEC\x8A\xA4\xED\x84\xB4") ||
-          strstr(translated, "\xED\x8F\xAC\xEC\xB0\xA9")) { // ??揶?        // Use memory flags OR global menu flag
-        if (IsMenuActive() || s_InMenu)
-          return;
-      }
-      if (IsMenuActive() || s_InMenu) {
-        auto itKor =
-            g_KeyToKorean.find("SUBTITLE_CLOCKWORK_DIZ_NORTHERNRIDGE32");
-        if (itKor != g_KeyToKorean.end()) {
-          const std::string &targetKor = itKor->second;
-          if (!targetKor.empty() && strstr(translated, targetKor.c_str()))
-            return;
         }
       }
     }
@@ -7457,7 +6914,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
     // scroll content
     // Tag as menu source so KoreanRenderer caches these items across frames
     // where R_AddCmdDrawText doesn't fire (in-game pause UI update frequency).
-    extern std::atomic<bool> g_bQueueFromMenu;
+    extern thread_local std::atomic<bool> g_bQueueFromMenu;
     g_bQueueFromMenu.store(true);
 
     std::string gameplayAlignKey = translatedKey;
@@ -7645,180 +7102,6 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
         (g_controlsBindHeaderSeenTick != 0 &&
          (nowMenuAlignTick - g_controlsBindHeaderSeenTick) < 650);
     const bool inControlsBindMenuEffective = inControlsBindHeaderMenu;
-
-    // Controls keybind pages ("이동/동작/시선"): localize value-column bind
-    // strings, including composite forms like "Left Mouse or Right Mouse".
-    // preserveSingleAsciiAlpha=true keeps single-letter binds (e.g. H) as-is.
-    if (menuContext && screenWidth > 0.0f && screenHeight > 0.0f &&
-        !resolvedText.empty()) {
-      const bool inBindValueBand =
-          (x >= screenWidth * 0.26f && x <= screenWidth * 0.70f &&
-           y >= screenHeight * 0.16f && y <= screenHeight * 0.92f);
-      if (inBindValueBand) {
-        auto IsSimpleBindTokenUpper = [](const std::string &u) -> bool {
-          if (u.empty()) {
-            return false;
-          }
-          if (u == "SPACE" || u == "CTRL" || u == "SHIFT" || u == "ALT" ||
-              u == "TAB" || u == "ENTER" || u == "ESC" || u == "INS" ||
-              u == "DEL" || u == "PGUP" || u == "PGDN" || u == "HOME" ||
-              u == "END" || u == "MOUSE1" || u == "MOUSE2" ||
-              u == "MOUSE3" || u == "MWHEELUP" || u == "MWHEELDOWN") {
-            return true;
-          }
-          if (u.size() == 1 &&
-              std::isalnum((unsigned char)u[0])) {
-            return true;
-          }
-          if (u.size() >= 2 && u.size() <= 4 && u[0] == 'F') {
-            bool allDigits = true;
-            for (size_t i = 1; i < u.size(); ++i) {
-              if (!std::isdigit((unsigned char)u[i])) {
-                allDigits = false;
-                break;
-              }
-            }
-            if (allDigits) {
-              return true;
-            }
-          }
-          return false;
-        };
-
-        auto IsMouseWheelValueTokenUpper = [](const std::string &u) -> bool {
-          return (u == "LEFT MOUSE" || u == "RIGHT MOUSE" ||
-                  u == "MIDDLE MOUSE" || u == "MOUSE LEFT" ||
-                  u == "MOUSE RIGHT" || u == "MOUSE MIDDLE" ||
-                  u == "MOUSE1" || u == "MOUSE2" || u == "MOUSE3" ||
-                  u == "MWHEELUP" || u == "MWHEELDOWN" || u == "WHEEL UP" ||
-                  u == "WHEEL DOWN");
-        };
-
-        auto IsCompositeBindValueUpper = [&](const std::string &u) -> bool {
-          auto TrimAsciiToken = [](const std::string &s) -> std::string {
-            size_t b = 0;
-            while (b < s.size() && std::isspace((unsigned char)s[b])) {
-              ++b;
-            }
-            size_t e = s.size();
-            while (e > b && std::isspace((unsigned char)s[e - 1])) {
-              --e;
-            }
-            return s.substr(b, e - b);
-          };
-          auto FindDelimiter = [&](size_t from, size_t &delimLen) -> size_t {
-            delimLen = 0;
-            size_t dOr = u.find(" OR ", from);
-            size_t dKeyOr = u.find(" KEY_OR ", from);
-            size_t dKor = u.find(" 또는 ", from);
-            size_t d = std::string::npos;
-            if (dOr != std::string::npos) {
-              d = dOr;
-            }
-            if (dKeyOr != std::string::npos &&
-                (d == std::string::npos || dKeyOr < d)) {
-              d = dKeyOr;
-            }
-            if (dKor != std::string::npos &&
-                (d == std::string::npos || dKor < d)) {
-              d = dKor;
-            }
-            if (d == dOr) {
-              delimLen = 4;
-            } else if (d == dKeyOr) {
-              delimLen = 8;
-            } else if (d == dKor) {
-              delimLen = 8;
-            }
-            return d;
-          };
-
-          size_t delimLenProbe = 0;
-          if (FindDelimiter(0, delimLenProbe) == std::string::npos ||
-              delimLenProbe == 0) {
-            return false;
-          }
-
-          size_t pos = 0;
-          size_t parts = 0;
-          while (pos <= u.size()) {
-            size_t delimLen = 0;
-            size_t d = FindDelimiter(pos, delimLen);
-            std::string part = (d == std::string::npos)
-                                   ? u.substr(pos)
-                                   : u.substr(pos, d - pos);
-            part = TrimAsciiToken(part);
-            if (part.empty()) {
-              return false;
-            }
-            const bool partIsBind =
-                IsSimpleBindTokenUpper(part) || part.rfind("KEY_", 0) == 0 ||
-                IsMouseWheelValueTokenUpper(part);
-            if (!partIsBind) {
-              return false;
-            }
-            ++parts;
-            if (d == std::string::npos) {
-              break;
-            }
-            pos = d + delimLen;
-          }
-          return parts >= 2;
-        };
-
-        auto IsExplicitMouseWheelValueText =
-            [&](const std::string &probe, const std::string &probeUpper)
-            -> bool {
-          if (probe == "마우스 왼쪽" || probe == "마우스 오른쪽" ||
-              probe == "마우스 가운데" || probe == "휠 위로" ||
-              probe == "휠 아래로") {
-            return true;
-          }
-          return IsMouseWheelValueTokenUpper(probeUpper);
-        };
-
-        auto LooksLikeBindValueText = [&](const std::string &probe,
-                                          const std::string &probeUpper) -> bool {
-          if (probe.empty()) {
-            return false;
-          }
-          return (probe.find("할당되지 않음") != std::string::npos ||
-                  IsCompositeBindValueUpper(probeUpper) ||
-                  IsExplicitMouseWheelValueText(probe, probeUpper) ||
-                  probe.find("또는") != std::string::npos ||
-                  probeUpper.find("NOT BOUND") != std::string::npos ||
-                  probeUpper.find("UNBOUND") != std::string::npos ||
-                  probeUpper.rfind("KEY_", 0) == 0 ||
-                  IsSimpleBindTokenUpper(probeUpper));
-        };
-
-        std::string bindSource = resolvedText;
-        std::string resolvedNorm = NormalizeMenuText(resolvedText);
-        std::string resolvedUpper = ToUpperAscii(resolvedNorm);
-        const bool resolvedLooksLikeBind =
-            LooksLikeBindValueText(resolvedNorm, resolvedUpper);
-        bool rawLooksLikeBind = false;
-        if (text && text[0]) {
-          std::string rawBind = NormalizeMenuText(std::string(text));
-          std::string rawBindUpper = ToUpperAscii(rawBind);
-          rawLooksLikeBind = LooksLikeBindValueText(rawBind, rawBindUpper);
-          if (rawLooksLikeBind) {
-            bindSource = rawBind;
-          }
-        }
-
-        const bool shouldLocalizeBindValue =
-            (inControlsBindHeaderMenu || rawLooksLikeBind ||
-             resolvedLooksLikeBind);
-        if (shouldLocalizeBindValue) {
-          std::string localizedBindValue =
-              BindingResolver::LocalizeBindingDisplayText(bindSource, true);
-          if (!localizedBindValue.empty()) {
-            resolvedText = localizedBindValue;
-          }
-        }
-      }
-    }
 
     // Stick/Button-layout legend: hard fallback translation for split/variant
     // English draws that bypass normal map matching.
@@ -8269,7 +7552,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
 
       // Movement bind page: suppress stray duplicated labels outside the
       // protected center panel (header/footer leak artifacts).
-      if (inMovementHeaderMenu && screenHeight > 0.0f) {
+      if (!NativeMenuCapture::IsFrameActive() && inMovementHeaderMenu && screenHeight > 0.0f) {
         // Hardcoded guard for movement-page top clipping leaks.
         const bool isMoveTopLeakLabel =
             (clipProbe.find("위로 이동") != std::string::npos ||
@@ -8467,7 +7750,7 @@ void __fastcall Detour_R_AddCmdDrawText(const char *text, int maxChars,
           y < GetScreenHeightApprox() * 0.16f &&
           text && strstr(text, "PROFILE:") != nullptr;
       const bool isAnimatedHdr = isAnimatedHdrByKey || isAnimatedHdrByText;
-      if (isAnimatedHdr) {
+      if (isAnimatedHdr && !NativeMenuCapture::CurrentText().valid) {
         // Latch x once per page (reset when header text changes)
         static std::string s_rkHdrLastText;
         std::string hdrId = translatedKey.empty() ? std::string(text ? text : "") : translatedKey;
@@ -8726,7 +8009,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
   // Native HUD capture (HUD_DrawText hook) may only become executable much later
   // (post-decryption / after loading). Keep this thread alive long enough to
   // observe that transition; otherwise HUD native capture silently never enables.
-  const bool needHudDrawHook = TextHook_IsHudNativeEnabled();
+  const bool needHudDrawHook = false;
   const bool needTimeScriptHook = false; // Legacy target was mid-function, not a callable ABI.
   const int kMaxIters = needHudDrawHook ? 600 : 120; // 5min vs 1min (500ms sleep)
 
@@ -8735,7 +8018,7 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
     Sleep(500);
 
     const bool cgMsgHookNeeded =
-        RuntimeFlags_ObjectiveStatusEnableGameMessage() &&
+        !TextHook_UsesNativeGameplayText() && RuntimeFlags_ObjectiveStatusEnableGameMessage() &&
         g_CG_GameMessage_TargetAddr != nullptr;
 
     // Late-bind R_TextWidth when IW6 code becomes executable (decrypted).
@@ -8849,29 +8132,10 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
       }
     }
 
-    // === CG_DrawHudElem Hook — runtime function discovery ===
-    // We know SEH_StringEd_GetString is called from inside CG_DrawHudElem
-    // at caller offset 0x1F087D.  Scan backward from that address to find
-    // the function prologue (CC padding), then hook it.
-    if (!g_CG_DrawHudElem_Hooked && seh_hooked) {
-      static uintptr_t s_cgDrawHudElemAddr = 0;
-      if (s_cgDrawHudElemAddr == 0 && GameBuild::RuntimeReady()) {
-        // Exact function boundary verified from both stock runtime captures.
-        s_cgDrawHudElemAddr = (uintptr_t)GetModuleHandleW(nullptr) + IW6Offsets::CG_DrawHudElem_SP;
-      }
-      if (s_cgDrawHudElemAddr != 0 && !g_CG_DrawHudElem_Hooked) {
-        CreateHook((void *)s_cgDrawHudElemAddr,
-                   (void *)&Detour_CG_DrawHudElem,
-                   (void **)&Original_CG_DrawHudElem);
-        if (Original_CG_DrawHudElem) {
-          g_CG_DrawHudElem_Hooked = true;
-          LogToFile("[TextHook] SUCCESS: CG_DrawHudElem hook applied! "
-                    "English flicker suppression active.");
-        } else {
-          LogToFile("[TextHook] FAILED: CG_DrawHudElem hook.");
-        }
-      }
-    }
+    // Install the final native path before considering legacy capture hooks.
+    // Hook readiness is independent of renderer readiness during startup.
+    if (Original_R_AddCmdDrawText && seh_hooked) NativeHudCaption::Initialize();
+    const bool nativeGameplayInstalled = NativeHudCaption::ready.load(std::memory_order_acquire);
 
     // === SL_ConvertToString - CUSTOM 14-byte JMP hook (no gateway) ===
     // The function is only 24 bytes with a short jump at offset 2,
@@ -9496,579 +8760,12 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
 
     // OSREV chain hooks removed — OSAUTH is the sole authority.
 
-    // === IntroTextLayout Hook (0x3F3DE0) - Intro/chyron text rendering ===
-    if (!g_ITL_Hooked && g_SLC_HookApplied) {
-      uintptr_t itlBase = (uintptr_t)GetModuleHandleA(NULL);
-      uintptr_t itlAddr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(itlBase, IW6Offsets::IntroTextLayout_SP));
-      unsigned char *itlBytes = (unsigned char *)itlAddr;
-
-      // Verify prologue matches expected bytes
-      // 48 89 5c 24 10 = MOV [RSP+10h], RBX
-      // 44 89 44 24 18 = MOV [RSP+18h], R8D
-      if (itlBytes[0] == 0x48 && itlBytes[1] == 0x89 && itlBytes[2] == 0x5C &&
-          itlBytes[5] == 0x44 && itlBytes[6] == 0x89) {
-        LogToFile("[TextHook] IntroTextLayout prologue verified, hooking...");
-
-        // Prologue: MOV [RSP+10],RBX(5) + MOV [RSP+18],R8D(5) +
-        //   PUSH RBP(1) + PUSH RSI(1) + PUSH RDI(1) + PUSH R12(2) = 15
-        // No RIP-relative instructions in stolen range
-        CreateHook((void *)itlAddr, (void *)&Detour_IntroTextLayout,
-                   (void **)&Original_IntroTextLayout, 15);
-
-        if (Original_IntroTextLayout) {
-          g_ITL_Hooked = true;
-          LogToFile("[TextHook] SUCCESS: IntroTextLayout (0x3F3DE0) hooked!");
-        } else {
-          LogToFile("[TextHook] FAILED: IntroTextLayout (0x3F3DE0) hook");
-        }
-      } else {
-        char byteBuf[128];
-        sprintf_s(byteBuf,
-                  "[TextHook] IntroTextLayout prologue mismatch: %02X %02X %02X %02X "
-                  "%02X %02X %02X",
-                  itlBytes[0], itlBytes[1], itlBytes[2], itlBytes[3],
-                  itlBytes[4], itlBytes[5], itlBytes[6]);
-        LogToFile(byteBuf);
-      }
-    }
-
-    // === IntroRenderFn Hook (0x1F1740) - Captures render context arg3 ===
-    if (!g_IRF_Hooked && g_ITL_Hooked) {
-      uintptr_t irfBase = (uintptr_t)GetModuleHandleA(NULL);
-      uintptr_t irfAddr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(irfBase, IW6Offsets::IntroRender_SP));
-      unsigned char *irfBytes = (unsigned char *)irfAddr;
-
-      // Verify prologue: 48 89 5c 24 08 = MOV [RSP+8], RBX
-      //                  48 89 74 24 10 = MOV [RSP+10h], RSI
-      if (irfBytes[0] == 0x48 && irfBytes[1] == 0x89 && irfBytes[2] == 0x5C &&
-          irfBytes[5] == 0x48 && irfBytes[6] == 0x89 && irfBytes[7] == 0x74) {
-        LogToFile("[TextHook] IntroRenderFn prologue verified, hooking...");
-
-        // Prologue: MOV [RSP+8],RBX(5) + MOV [RSP+10],RSI(5) +
-        //   PUSH RDI(1) + SUB RSP,0x20(4) = 15 bytes
-        // No RIP-relative instructions in stolen range
-        CreateHook((void *)irfAddr, (void *)&Detour_IntroRenderFn,
-                   (void **)&Original_IntroRenderFn, 15);
-
-        if (Original_IntroRenderFn) {
-          g_IRF_Hooked = true;
-          LogToFile("[TextHook] SUCCESS: IntroRenderFn (0x1F1740) hooked!");
-
-          // === CALLSCAN+HEXDUMP: 0x416AE0 (IntroActualRender) ===
-          // IntroRenderFn is only 79 bytes and TAIL-JMPs to 0x416AE0.
-          // 0x416AE0 receives (type, layoutResult, renderCtx, count)
-          // and is the REAL rendering function. Scan it for E8/E9/FF15.
-          {
-            unsigned char *fnStart = (unsigned char *)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(irfBase, IW6Offsets::IntroActualRender_SP)));
-            const int scanLen = 4096;
-            int callCount = 0;
-            LogToFile("[SCAN416] Scanning IntroActualRender (0x416AE0)...");
-
-            // Hex dump first 512 bytes for disassembly
-            for (int row = 0; row < 512; row += 32) {
-              std::stringstream ss;
-              ss << "[HEX416] +" << std::hex << std::setw(4)
-                 << std::setfill('0') << row << ": ";
-              for (int bi = row; bi < row + 32 && bi < 512; bi++) {
-                ss << std::hex << std::setw(2) << std::setfill('0')
-                   << (int)fnStart[bi] << " ";
-              }
-              LogToFile(ss.str());
-            }
-
-            // Scan for E8 CALL, E9 JMP, FF15 indirect CALL
-            for (int ci = 0; ci < scanLen - 5; ci++) {
-              unsigned char *p = fnStart + ci;
-
-              if (p[0] == 0xE8) {
-                int32_t rel = *(int32_t *)(p + 1);
-                uintptr_t target = (uintptr_t)(p + 5) + rel;
-                uintptr_t offset = target - irfBase;
-                // Filter out bogus targets (must be in module range)
-                if (offset < 0x8000000) {
-                  char buf[256];
-                  sprintf_s(buf, "[SCAN416] +%04X: E8 CALL -> base+0x%llX",
-                            ci, (unsigned long long)offset);
-                  LogToFile(buf);
-                  callCount++;
-                }
-              }
-              else if (p[0] == 0xE9) {
-                int32_t rel = *(int32_t *)(p + 1);
-                uintptr_t target = (uintptr_t)(p + 5) + rel;
-                uintptr_t offset = target - irfBase;
-                if (offset < 0x8000000 && ci > 8) {
-                  char buf[256];
-                  sprintf_s(buf, "[SCAN416] +%04X: E9 JMP -> base+0x%llX",
-                            ci, (unsigned long long)offset);
-                  LogToFile(buf);
-                  callCount++;
-                }
-              }
-              else if (p[0] == 0xFF && p[1] == 0x15) {
-                int32_t rel = *(int32_t *)(p + 2);
-                uintptr_t ptrAddr = (uintptr_t)(p + 6) + rel;
-                char buf[256];
-                sprintf_s(buf, "[SCAN416] +%04X: FF15 CALL [RIP] -> ptr at base+0x%llX",
-                          ci, (unsigned long long)(ptrAddr - irfBase));
-                LogToFile(buf);
-                callCount++;
-              }
-              // Function end: RET + padding or next function prologue
-              if (p[0] == 0xC3 && ci > 32) {
-                if (ci + 1 < scanLen && (p[1] == 0xCC || p[1] == 0x90 ||
-                    (p[1] == 0x48 && p[2] == 0x89))) {
-                  char buf[128];
-                  sprintf_s(buf, "[SCAN416] Function end at +%04X (RET)", ci);
-                  LogToFile(buf);
-                  break;
-                }
-              }
-            }
-            char buf[128];
-            sprintf_s(buf, "[SCAN416] Scan complete. Found %d CALL/JMP instructions.", callCount);
-            LogToFile(buf);
-          }
-
-          if (!g_IAR_Hooked) {
-            uintptr_t iarAddr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(irfBase, IW6Offsets::IntroActualRender_SP));
-            unsigned char *iarBytes = (unsigned char *)iarAddr;
-            const bool introActualRenderPrologueOk =
-                iarBytes[0] == 0x48 && iarBytes[1] == 0x89 &&
-                iarBytes[2] == 0x5C && iarBytes[3] == 0x24 &&
-                iarBytes[4] == 0x18 && iarBytes[5] == 0x89 &&
-                iarBytes[6] == 0x4C && iarBytes[7] == 0x24 &&
-                iarBytes[8] == 0x08 && iarBytes[9] == 0x55 &&
-                iarBytes[10] == 0x56 && iarBytes[11] == 0x57 &&
-                iarBytes[12] == 0x41 && iarBytes[13] == 0x54 &&
-                iarBytes[14] == 0x41 && iarBytes[15] == 0x55 &&
-                iarBytes[16] == 0x41 && iarBytes[17] == 0x56 &&
-                iarBytes[18] == 0x41 && iarBytes[19] == 0x57;
-            if (introActualRenderPrologueOk) {
-              LogToFile(
-                  "[TextHook] IntroActualRender(0x416AE0) prologue verified, hooking...");
-              CreateHook((void *)iarAddr, (void *)&Detour_IntroActualRender,
-                         (void **)&Original_IntroActualRender, 20);
-              if (Original_IntroActualRender) {
-                g_IAR_Hooked = true;
-                LogToFile(
-                    "[TextHook] SUCCESS: IntroActualRender (0x416AE0) hooked!");
-              } else {
-                LogToFile(
-                    "[TextHook] FAILED: IntroActualRender (0x416AE0) hook");
-              }
-            } else {
-              char iarBuf[192];
-              sprintf_s(
-                  iarBuf,
-                  "[TextHook] IntroActualRender prologue mismatch: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-                  iarBytes[0], iarBytes[1], iarBytes[2], iarBytes[3],
-                  iarBytes[4], iarBytes[5], iarBytes[6], iarBytes[7],
-                  iarBytes[8], iarBytes[9]);
-              LogToFile(iarBuf);
-            }
-          }
-
-          // === HEX DUMP + CALLSCAN: 0x1F0CE0 (ViewportSetup) ===
-          // 0x1F17A0 calls this function 2x for lerp.
-          // Safe area calculation is INSIDE this function.
-          // Dump 1024 bytes + scan for MULSS/ADDSS/CALL patterns.
-          {
-            unsigned char *vpStart = (unsigned char *)(reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(irfBase, IW6Offsets::IntroSubRender_SP)));
-            LogToFile("[HEXVP] Dumping 0x1F0CE0 (ViewportSetup)...");
-            int vpLen = 1024;
-            for (int row = 0; row < vpLen; row += 32) {
-              std::stringstream ss;
-              ss << "[HEXVP] +" << std::hex << std::setw(4)
-                 << std::setfill('0') << row << ": ";
-              int end = row + 32;
-              if (end > vpLen) end = vpLen;
-              for (int bi = row; bi < end; bi++) {
-                ss << std::hex << std::setw(2) << std::setfill('0')
-                   << (int)vpStart[bi] << " ";
-              }
-              LogToFile(ss.str());
-            }
-
-            // Scan all F3 0F xx instructions (MOVSS/MULSS/ADDSS/SUBSS/DIVSS)
-            // to find RIP-relative memory references (float constants + globals)
-            int foundCount = 0;
-            for (int ci = 0; ci < vpLen - 8; ci++) {
-              unsigned char *p = vpStart + ci;
-              if (p[0] != 0xF3 || p[1] != 0x0F) continue;
-              // Check for [RIP+disp32] addressing: ModR/M byte & 0xC7 == 0x05
-              // Opcodes: 10=MOVSS, 11=MOVSS store, 58=ADDSS, 59=MULSS, 5C=SUBSS, 5E=DIVSS
-              unsigned char op = p[2];
-              if (op != 0x10 && op != 0x58 && op != 0x59 &&
-                  op != 0x5C && op != 0x5E) continue;
-              unsigned char modrm = p[3];
-              if ((modrm & 0xC7) != 0x05) continue; // [RIP+disp32]
-              int reg = (modrm >> 3) & 7;
-              int32_t disp = *(int32_t *)(p + 4);
-              uintptr_t target = (uintptr_t)(p + 8) + disp;
-              uintptr_t offset = target - irfBase;
-              float val = 0.0f;
-              if (offset < 0x8000000 && !IsBadReadPtr((void *)target, 4)) {
-                val = *(volatile float *)target;
-              }
-              const char *opName = "???";
-              if (op == 0x10) opName = "MOVSS";
-              else if (op == 0x58) opName = "ADDSS";
-              else if (op == 0x59) opName = "MULSS";
-              else if (op == 0x5C) opName = "SUBSS";
-              else if (op == 0x5E) opName = "DIVSS";
-              char buf2[256];
-              sprintf_s(buf2,
-                "[VPSCAN] +%04X: %s XMM%d,[RIP+0x%X] -> base+0x%llX = %.6f",
-                ci, opName, reg, (unsigned)disp,
-                (unsigned long long)offset, val);
-              LogToFile(buf2);
-              foundCount++;
-            }
-
-            // Also scan E8 CALLs
-            for (int ci = 0; ci < vpLen - 5; ci++) {
-              if (vpStart[ci] == 0xE8) {
-                int32_t rel = *(int32_t *)(vpStart + ci + 1);
-                uintptr_t target = (uintptr_t)(vpStart + ci + 5) + rel;
-                uintptr_t offset = target - irfBase;
-                if (offset < 0x8000000) {
-                  char buf2[256];
-                  sprintf_s(buf2, "[VPSCAN] +%04X: E8 CALL -> base+0x%llX",
-                    ci, (unsigned long long)offset);
-                  LogToFile(buf2);
-                  foundCount++;
-                }
-              }
-              // RET detection
-              if (vpStart[ci] == 0xC3 && ci > 32) {
-                if (ci + 1 < vpLen && (vpStart[ci+1] == 0xCC ||
-                    vpStart[ci+1] == 0x90 ||
-                    (vpStart[ci+1] == 0x48 && vpStart[ci+2] == 0x89))) {
-                  char buf2[128];
-                  sprintf_s(buf2, "[VPSCAN] Function end at +%04X (RET)", ci);
-                  LogToFile(buf2);
-                  break;
-                }
-              }
-            }
-            char buf2[128];
-            sprintf_s(buf2, "[VPSCAN] Scan complete. %d entries.", foundCount);
-            LogToFile(buf2);
-          }
-        } else {
-          LogToFile("[TextHook] FAILED: IntroRenderFn (0x1F1740) hook");
-        }
-      } else {
-        char byteBuf[128];
-        sprintf_s(byteBuf,
-                  "[TextHook] IntroRenderFn prologue mismatch: %02X %02X %02X "
-                  "%02X %02X %02X %02X %02X",
-                  irfBytes[0], irfBytes[1], irfBytes[2], irfBytes[3],
-                  irfBytes[4], irfBytes[5], irfBytes[6], irfBytes[7]);
-        LogToFile(byteBuf);
-      }
-    }
-
-    // === IRFSub1 Hook (0x1F0CE0) - Called 3x from IntroRenderFn ===
-    // This function is the most likely candidate for the actual text
-    // rendering / coordinate-transform call within IntroRenderFn.
-    // Disabled in production: this analysis hook is extremely hot and causes
-    // heavy log/CPU overhead.
-    if (false && !g_IRFSub1_Hooked && g_IRF_Hooked) {
-      uintptr_t sub1Base = (uintptr_t)GetModuleHandleA(NULL);
-      uintptr_t sub1Addr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(sub1Base, IW6Offsets::IntroSubRender_SP));
-      unsigned char *sub1Bytes = (unsigned char *)sub1Addr;
-
-      // Log prologue for analysis
-      {
-        std::stringstream ss;
-        ss << "[TextHook] IRFSub1(0x1F0CE0) prologue: ";
-        for (int bi = 0; bi < 20; bi++) {
-          ss << std::hex << std::setw(2) << std::setfill('0')
-             << (int)sub1Bytes[bi] << " ";
-        }
-        LogToFile(ss.str());
-      }
-
-      // Try to determine stolenBytes from prologue pattern
-      int sub1Stolen = 0;
-
-      // Pattern 1: MOV [RSP+8],RBX(5) + MOV [RSP+10],RSI(5) + PUSH(1) + SUB RSP(4) = 15
-      if (sub1Bytes[0] == 0x48 && sub1Bytes[1] == 0x89 &&
-          sub1Bytes[5] == 0x48 && sub1Bytes[6] == 0x89) {
-        sub1Stolen = 15;
-        LogToFile("[TextHook] IRFSub1 prologue: MOV+MOV pattern, stolenBytes=15");
-      }
-      // Pattern 2: SUB RSP,xx (48 83 EC xx = 4 bytes) ??too short, need more
-      // Pattern 3: MOV [RSP+8],RCX(5) + SUB RSP,xx(4) = look at next bytes
-      else if (sub1Bytes[0] == 0x48 && sub1Bytes[1] == 0x83 && sub1Bytes[2] == 0xEC) {
-        // SUB RSP, imm8 = 4 bytes. Need more context.
-        // Check if followed by more instructions that total >= 14
-        sub1Stolen = 14; // minimum, may crash
-        LogToFile("[TextHook] IRFSub1 prologue: SUB RSP pattern, stolenBytes=14 (risky)");
-      }
-      // Pattern 4: PUSH RBX (40 53) or similar
-      else if (sub1Bytes[0] == 0x40 || sub1Bytes[0] == 0x41 ||
-               sub1Bytes[0] == 0x48 || sub1Bytes[0] == 0x4C) {
-        // REX prefix family - assume standard prologue
-        sub1Stolen = 15;
-        LogToFile("[TextHook] IRFSub1 prologue: REX prefix, trying stolenBytes=15");
-      }
-
-      if (sub1Stolen >= 14) {
-        CreateHook((void *)sub1Addr, (void *)&Detour_IRFSub1,
-                   (void **)&Original_IRFSub1, sub1Stolen);
-        if (Original_IRFSub1) {
-          g_IRFSub1_Hooked = true;
-          LogToFile("[TextHook] SUCCESS: IRFSub1 (0x1F0CE0) hooked!");
-        } else {
-          LogToFile("[TextHook] FAILED: IRFSub1 (0x1F0CE0) hook");
-        }
-      } else {
-        LogToFile("[TextHook] IRFSub1: Cannot determine stolenBytes, skipping hook");
-      }
-    }
-
-    // === IRFSub2 Hook (0x6275A0) - Called 2x from IntroRenderFn ===
-    // Prologue: 48 83 EC 58 = SUB RSP, 0x58 (4 bytes, too short for 14-byte JMP)
-    // Need to check total instruction boundary. SUB RSP,0x58 (4) + next instructions...
-    // Actually 48 83 EC 58 = SUB RSP, imm8 is 4 bytes with REX prefix.
-    // Followed by: 45 33 C0(3) = XOR R8D, R8D  [total 7]
-    //              0F 28 C8(3) = MOVAPS XMM1, XMM0  [total 10]
-    //              F3 0F 11 4C 24 60(6) = MOVSS [RSP+60h], XMM1  [total 16 >= 14!]
-    // === IRFSub2 Hook (0x6275A0) - DISABLED: caused black screen crash ===
-    // stolenBytes=16 with MOVSS [RSP+60h] in stolen range may corrupt
-    // trampoline stack. Function is called too frequently from many callers.
-    // Investigate via CALLSCAN_ITL instead.
-    if (false && !g_IRFSub2_Hooked && g_IRF_Hooked) {
-      // disabled
-    }
-
-    // === R_AddCmdDrawTextWithCursor Hook - Text input, possibly subtitles ===
-    if (!g_CursorTextHookApplied && g_CursorTextTargetAddr) {
-      unsigned char *bytes = (unsigned char *)g_CursorTextTargetAddr;
-
-      // Log bytes for debugging (always log once)
-      static bool cursorBytesLogged = false;
-      if (!cursorBytesLogged) {
-        std::stringstream ss;
-        ss << "[TextHook] R_AddCmdDrawTextWithCursor bytes at 0x" << std::hex
-           << g_CursorTextTargetAddr << ": ";
-        for (int j = 0; j < 16; j++) {
-          ss << std::hex << std::setw(2) << std::setfill('0') << (int)bytes[j]
-             << " ";
-        }
-        LogToFile(ss.str());
-        cursorBytesLogged = true;
-      }
-
-      // Only skip if code is clearly not ready (int3 breakpoints)
-      bool codeNotReady = (bytes[0] == 0xCC && bytes[1] == 0xCC);
-      if (!codeNotReady) {
-        LogToFile("[TextHook] R_AddCmdDrawTextWithCursor applying hook...");
-
-        // Same signature as R_AddCmdDrawText - sub rsp (4), mov rax (7) = 11+
-        // bytes
-        CreateHook(g_CursorTextTargetAddr,
-                   (void *)&Detour_R_AddCmdDrawTextWithCursor,
-                   (void **)&Original_R_AddCmdDrawTextWithCursor, 14);
-
-        if (Original_R_AddCmdDrawTextWithCursor) {
-          g_CursorTextHookApplied = true;
-          LogToFile(
-              "[TextHook] SUCCESS: R_AddCmdDrawTextWithCursor hook applied!");
-        } else {
-          LogToFile(
-              "[TextHook] WARNING: R_AddCmdDrawTextWithCursor hook failed.");
-        }
-      }
-    }
-
-    // === TimeScript HUD draw Hook (0x555EA0) - dedicated countdown HUD ===
-    if (needTimeScriptHook && !g_TimeScriptHooked) {
-      const uintptr_t tsBase = (uintptr_t)GetModuleHandleA(NULL);
-      const uintptr_t tsAddr = tsBase + IW6Offsets::Profile::Rva_555EA0;
-      if (!IsProbablyExecutableCode((void *)tsAddr)) {
-        static DWORD s_lastTimeScriptDefer = 0;
-        const DWORD nowDefer = GetTickCount();
-        if ((nowDefer - s_lastTimeScriptDefer) > 5000) {
-          s_lastTimeScriptDefer = nowDefer;
-          LogToFile(
-              "[TextHook] TimeScript HUD hook deferred (0x555EA0 not executable yet)");
-        }
-      } else {
-        if (!g_TimeScriptPreStub) {
-          g_TimeScriptPreStub =
-              VirtualAlloc(NULL, 512, MEM_COMMIT | MEM_RESERVE,
-                           PAGE_EXECUTE_READWRITE);
-        }
-
-        if (g_TimeScriptPreStub) {
-          unsigned char *s = (unsigned char *)g_TimeScriptPreStub;
-          int off = 0;
-
-          auto emit8 = [&](unsigned char v) { s[off++] = v; };
-          auto emit32 = [&](uint32_t v) {
-            *(uint32_t *)(s + off) = v;
-            off += 4;
-          };
-          auto emit64 = [&](uint64_t v) {
-            *(uint64_t *)(s + off) = v;
-            off += 8;
-          };
-
-          // sub rsp, 0xB8
-          emit8(0x48); emit8(0x81); emit8(0xEC); emit32(0x000000B8);
-
-          // Save caller-saved GPRs.
-          emit8(0x48); emit8(0x89); emit8(0x4C); emit8(0x24); emit8(0x20); // rcx
-          emit8(0x48); emit8(0x89); emit8(0x54); emit8(0x24); emit8(0x28); // rdx
-          emit8(0x4C); emit8(0x89); emit8(0x44); emit8(0x24); emit8(0x30); // r8
-          emit8(0x4C); emit8(0x89); emit8(0x4C); emit8(0x24); emit8(0x38); // r9
-          emit8(0x4C); emit8(0x89); emit8(0x54); emit8(0x24); emit8(0x40); // r10
-          emit8(0x4C); emit8(0x89); emit8(0x5C); emit8(0x24); emit8(0x48); // r11
-          emit8(0x48); emit8(0x89); emit8(0x44); emit8(0x24); emit8(0x50); // rax
-
-          // Save caller-saved XMMs (float args may live here).
-          emit8(0xF3); emit8(0x0F); emit8(0x7F); emit8(0x44); emit8(0x24); emit8(0x60); // xmm0
-          emit8(0xF3); emit8(0x0F); emit8(0x7F); emit8(0x4C); emit8(0x24); emit8(0x70); // xmm1
-          emit8(0xF3); emit8(0x0F); emit8(0x7F); emit8(0x54); emit8(0x24); emit8(0x80); // xmm2
-          emit8(0xF3); emit8(0x0F); emit8(0x7F); emit8(0x5C); emit8(0x24); emit8(0x90); // xmm3
-          emit8(0xF3); emit8(0x0F); emit8(0x7F); emit8(0x64); emit8(0x24); emit8(0xA0); // xmm4
-          emit8(0xF3); emit8(0x0F); emit8(0x7F); emit8(0x6C); emit8(0x24); emit8(0xB0); // xmm5
-
-          // Save entry RSP/RBX... to g_TimeScriptCallerRegs.
-          emit8(0x48); emit8(0xB8); emit64((uint64_t)&g_TimeScriptCallerRegs); // mov rax, &regs
-          emit8(0x48); emit8(0x8D); emit8(0x8C); emit8(0x24); emit32(0x000000B8); // lea rcx, [rsp+0xB8]
-          emit8(0x48); emit8(0x89); emit8(0x08); // [rax+0] = rcx(entry rsp)
-          emit8(0x48); emit8(0x89); emit8(0x58); emit8(0x08); // [rax+8] = rbx
-          emit8(0x48); emit8(0x89); emit8(0x68); emit8(0x10); // [rax+16] = rbp
-          emit8(0x48); emit8(0x89); emit8(0x78); emit8(0x18); // [rax+24] = rdi
-          emit8(0x48); emit8(0x89); emit8(0x70); emit8(0x20); // [rax+32] = rsi
-          emit8(0x4C); emit8(0x89); emit8(0x60); emit8(0x28); // [rax+40] = r12
-          emit8(0x4C); emit8(0x89); emit8(0x68); emit8(0x30); // [rax+48] = r13
-          emit8(0x4C); emit8(0x89); emit8(0x70); emit8(0x38); // [rax+56] = r14
-          emit8(0x4C); emit8(0x89); emit8(0x78); emit8(0x40); // [rax+64] = r15
-          emit8(0x48); emit8(0x8B); emit8(0x09); // mov rcx, [rcx]
-          emit8(0x48); emit8(0x89); emit8(0x48); emit8(0x48); // [rax+72] = ret
-
-          // Call pre-hook helper.
-          emit8(0x48); emit8(0xB8); emit64((uint64_t)&TimeScript_PreDrawHook);
-          emit8(0xFF); emit8(0xD0);
-
-          // Restore caller-saved XMMs.
-          emit8(0xF3); emit8(0x0F); emit8(0x6F); emit8(0x44); emit8(0x24); emit8(0x60); // xmm0
-          emit8(0xF3); emit8(0x0F); emit8(0x6F); emit8(0x4C); emit8(0x24); emit8(0x70); // xmm1
-          emit8(0xF3); emit8(0x0F); emit8(0x6F); emit8(0x54); emit8(0x24); emit8(0x80); // xmm2
-          emit8(0xF3); emit8(0x0F); emit8(0x6F); emit8(0x5C); emit8(0x24); emit8(0x90); // xmm3
-          emit8(0xF3); emit8(0x0F); emit8(0x6F); emit8(0x64); emit8(0x24); emit8(0xA0); // xmm4
-          emit8(0xF3); emit8(0x0F); emit8(0x6F); emit8(0x6C); emit8(0x24); emit8(0xB0); // xmm5
-
-          // Restore caller-saved GPRs.
-          emit8(0x48); emit8(0x8B); emit8(0x4C); emit8(0x24); emit8(0x20); // rcx
-          emit8(0x48); emit8(0x8B); emit8(0x54); emit8(0x24); emit8(0x28); // rdx
-          emit8(0x4C); emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x30); // r8
-          emit8(0x4C); emit8(0x8B); emit8(0x4C); emit8(0x24); emit8(0x38); // r9
-          emit8(0x4C); emit8(0x8B); emit8(0x54); emit8(0x24); emit8(0x40); // r10
-          emit8(0x4C); emit8(0x8B); emit8(0x5C); emit8(0x24); emit8(0x48); // r11
-          emit8(0x48); emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x50); // rax
-
-          // Call original trampoline (pointer loaded after CreateHook).
-          emit8(0x48); emit8(0xB8); emit64((uint64_t)&Original_TimeScriptDraw);
-          emit8(0x48); emit8(0x8B); emit8(0x00);
-          emit8(0xFF); emit8(0xD0);
-
-          // Save return regs around post-helper.
-          emit8(0x48); emit8(0x89); emit8(0x44); emit8(0x24); emit8(0x20); // rax
-          emit8(0x48); emit8(0x89); emit8(0x54); emit8(0x24); emit8(0x28); // rdx
-          emit8(0xF3); emit8(0x0F); emit8(0x7F); emit8(0x44); emit8(0x24); emit8(0x60); // xmm0
-          emit8(0xF3); emit8(0x0F); emit8(0x7F); emit8(0x4C); emit8(0x24); emit8(0x70); // xmm1
-
-          emit8(0x48); emit8(0xB8); emit64((uint64_t)&TimeScript_PostDrawHook);
-          emit8(0xFF); emit8(0xD0);
-
-          // Restore return regs and return to caller.
-          emit8(0xF3); emit8(0x0F); emit8(0x6F); emit8(0x44); emit8(0x24); emit8(0x60); // xmm0
-          emit8(0xF3); emit8(0x0F); emit8(0x6F); emit8(0x4C); emit8(0x24); emit8(0x70); // xmm1
-          emit8(0x48); emit8(0x8B); emit8(0x44); emit8(0x24); emit8(0x20); // rax
-          emit8(0x48); emit8(0x8B); emit8(0x54); emit8(0x24); emit8(0x28); // rdx
-          emit8(0x48); emit8(0x81); emit8(0xC4); emit32(0x000000B8); // add rsp, 0xB8
-          emit8(0xC3); // ret
-
-          FlushInstructionCache(GetCurrentProcess(), g_TimeScriptPreStub, off);
-        }
-
-        if (g_TimeScriptPreStub && !g_TimeScriptHooked) {
-          char pbuf[192];
-          sprintf_s(pbuf,
-                    "[TextHook] TimeScript pre-stub ready at %p target=0x%llX",
-                    g_TimeScriptPreStub, (unsigned long long)tsAddr);
-          LogToFile(pbuf);
-          CreateHook((void *)tsAddr, g_TimeScriptPreStub,
-                     (void **)&Original_TimeScriptDraw, 16);
-          if (Original_TimeScriptDraw) {
-            g_TimeScriptHooked = true;
-            LogToFile(
-                "[TextHook] SUCCESS: TimeScript HUD draw (0x555EA0) hooked!");
-          } else {
-            LogToFile(
-                "[TextHook] FAILED: TimeScript HUD draw (0x555EA0) hook");
-          }
-        }
-      }
-    }
-
-    // === HUD_DrawText Hook (0x3FE560) - Captures final screen coords ===
-    // Do not gate this on SLC; native capture is independent and should be ready
-    // whenever the function body becomes executable.
-    if (!g_HDT_Hooked) {
-      uintptr_t hdtBase = (uintptr_t)GetModuleHandleA(NULL);
-      uintptr_t hdtAddr = reinterpret_cast<uintptr_t>(IW6Offsets::GetAddress(hdtBase, IW6Offsets::HUD_DrawText_SP));
-      unsigned char *hdtBytes = (unsigned char *)hdtAddr;
-
-      if (!IsProbablyExecutableCode((void *)hdtAddr)) {
-        // Defer until the code section is decrypted/executable.
-        static DWORD s_lastHdtDefer = 0;
-        DWORD nowDefer = GetTickCount();
-        if (nowDefer - s_lastHdtDefer > 5000) {
-          s_lastHdtDefer = nowDefer;
-          LogToFile("[TextHook] HUD_DrawText hook deferred (code not executable yet)");
-        }
-      }
-      else
-      // Verify prologue: 48 89 5C 24 08 = MOV [RSP+8], RBX
-      //                  48 89 6C 24 10 = MOV [RSP+10h], RBP
-      if (hdtBytes[0] == 0x48 && hdtBytes[1] == 0x89 && hdtBytes[2] == 0x5C &&
-          hdtBytes[5] == 0x48 && hdtBytes[6] == 0x89 && hdtBytes[7] == 0x6C) {
-        LogToFile("[TextHook] HUD_DrawText(0x3FE560) prologue verified, "
-                  "hooking...");
-        CreateHook((void *)hdtAddr, (void *)&Detour_HUD_DrawText560,
-                   (void **)&Original_HUD_DrawText560, 15);
-        if (Original_HUD_DrawText560) {
-          g_HDT_Hooked = true;
-          LogToFile("[TextHook] SUCCESS: HUD_DrawText(0x3FE560) hooked!");
-        } else {
-          LogToFile("[TextHook] FAILED: HUD_DrawText(0x3FE560) hook");
-        }
-      } else {
-        char byteBuf[128];
-        sprintf_s(byteBuf,
-                  "[TextHook] HUD_DrawText prologue mismatch: %02X %02X %02X "
-                  "%02X %02X %02X %02X %02X",
-                  hdtBytes[0], hdtBytes[1], hdtBytes[2], hdtBytes[3],
-                  hdtBytes[4], hdtBytes[5], hdtBytes[6], hdtBytes[7]);
-        LogToFile(byteBuf);
-      }
-    }
-
     // All core hooks applied
     if (r_addcmd_hooked && seh_hooked && g_SLC_HookApplied &&
         g_R_TextWidth.load(std::memory_order_acquire) &&
         g_CfgToSlc_HookApplied && g_SL_StringTypeCheck_HookApplied &&
         (!cgMsgHookNeeded || g_CG_GameMessage_HookApplied) &&
-        (!needHudDrawHook || g_HDT_Hooked) &&
-        (!needTimeScriptHook || g_TimeScriptHooked)) {
+        nativeGameplayInstalled) {
       LogToFile("[TextHook] All hooks applied successfully!");
       return 0;
     }
@@ -10112,15 +8809,12 @@ DWORD WINAPI DelayedHookThread(LPVOID lpParam) {
   if (!g_SL_StringTypeCheck_HookApplied) {
     LogToFile("[TextHook] Timeout! sl_string_typecheck hook not applied.");
   }
-  if (RuntimeFlags_ObjectiveStatusEnableGameMessage() &&
+  if (!TextHook_UsesNativeGameplayText() && RuntimeFlags_ObjectiveStatusEnableGameMessage() &&
       g_CG_GameMessage_TargetAddr && !g_CG_GameMessage_HookApplied) {
     LogToFile("[TextHook] Timeout! CG_GameMessage hook not applied.");
   }
-  if (TextHook_IsHudNativeEnabled() && !g_HDT_Hooked) {
-    LogToFile("[TextHook] Timeout! HUD_DrawText hook not applied.");
-  }
-  if (false && TextHook_IsHudNativeEnabled() && !g_TimeScriptHooked) {
-    LogToFile("[TextHook] Timeout! TimeScript HUD draw hook not applied.");
+  if (!NativeHudCaption::ready.load(std::memory_order_acquire)) {
+    LogToFile("[TextHook] Native gameplay renderer unavailable; original English retained.");
   }
   // OSREV chain hook timeout checks removed — OSAUTH is the sole authority.
 

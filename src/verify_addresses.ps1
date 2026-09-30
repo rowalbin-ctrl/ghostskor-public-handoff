@@ -2,7 +2,7 @@ param([string]$ProjectRoot = $PSScriptRoot)
 $ErrorActionPreference = 'Stop'
 $patternSource = Get-Content -LiteralPath (Join-Path $ProjectRoot 'GameAddressPatterns.inl') -Raw
 $functionNames = [regex]::Matches($patternSource, '\{"(\w+)"') | ForEach-Object { $_.Groups[1].Value }
-if ($functionNames.Count -ne 31) { throw 'Expected 31 reviewed function patterns; update this check when the catalog changes.' }
+if ($functionNames.Count -ne 57) { throw 'Expected 57 reviewed function patterns; update this check when the catalog changes.' }
 $functionAlternation = ($functionNames | ForEach-Object { [regex]::Escape($_) }) -join '|'
 $baseNames = '(?:s_moduleBase_sp|s_moduleBase|moduleBase|irfBase|itlBase|sub1Base|hdtBase|base|mb)'
 $strippedTokens = '(?s)//[^\r\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|''(?:\\.|[^''\\])*'''

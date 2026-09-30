@@ -92,10 +92,10 @@ int main() {
   const float color[] = {1,1,1,1};
   for (bool qte : {false, true}) {
     s_QteScaleMode = qte;
-    for (float h : {48.0f, 72.0f, 78.0f, 90.0f, 99.0f, 160.0f, 500.0f}) {
-      for (float s : {0.8f, 1.0f, 1.6f, 4.0f}) {
+    for (float h : {48.0f, 54.0f, 62.0f, 72.0f, 78.0f, 90.0f, 99.0f, 160.0f, 500.0f}) {
+      for (float s : {0.8f, 1.0f, 1.6f, 1.8f, 4.0f}) {
         const float reference = KoreanRenderer::CalculateFinalScale(h,s);
-        for (float r : {1.0f, 4.0f/3.0f, 2.0f}) {
+        for (float r : {2.0f/3.0f, 1.0f, 4.0f/3.0f, 2.0f, 4.0f}) {
           const HudTextRenderer hud(1080.0f*r);
           assert(NearlyEqual(hud.CalculateFinalScale(h*r,s),reference*r));
           float width = hud.MeasureTextWidthEx("test",h*r,s);
